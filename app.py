@@ -65,32 +65,28 @@ DEFAULT_ENTREGA = {
     '01-EXPEDITE': 1, '02-PAST DUE': 2, '03-DUE': 3, '04-AHEAD': 4, '05-AHEAD': 5,
 }
 DEFAULT_LOTSIZE = {
-    'C-2600': 1, 'D-2200': 2, 'B-3300': 3, 'A-4000': 4, 'F-1000': 5,
-    'H-0400': 99, 'G-0850': 99, 'E-1600': 99, 'I-0300': 99, 'MQM': 99, 'P-0700': 99,
+    'D-2200': 1, 'C-2600': 2, 'F-1000': 3, 'B-3300': 4, 'A-4000': 5,
+    'H-0400': 6, 'G-0850': 7, 'E-1600': 8, 'I-0300': 9, 'MQM': 10, 'P-0700': 11,
 }
-
-# Cascada de color: dígito 3 de COLOR_A → nombre → ACTIVO(1) / INACTIVO(0)
 CASCADA_COLOR_NOMBRES = {
-    '0': 'BLANCO',
-    '1': 'AMARILLO',
-    '2': 'NARANJA',
-    '3': 'ROJO',
-    '4': 'MORADO',
-    '5': 'ROYAL',
-    '6': 'VERDE',
-    '7': 'CAFÉ',
-    '8': 'GRIS',
-    '9': 'NEGRO',
-}
-DEFAULT_CASCADA_ACTIVO = {
-    '0': 1, '1': 1, '2': 1, '3': 1, '4': 1,
-    '5': 1, '6': 1, '7': 1, '8': 1, '9': 1,
+    '0': 'BLANCO',   '1': 'AMARILLO', '2': 'NARANJA', '3': 'ROJO',
+    '4': 'MORADO',   '5': 'ROYAL',    '6': 'VERDE',   '7': 'CAFÉ',
+    '8': 'GRIS',     '9': 'NEGRO',
 }
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
 
+    # ── Inventario ────────────────────────────────────────────────────────────
+    st.markdown('<p class="section-title">Inventario disponible</p>', unsafe_allow_html=True)
+    usar_plan_ins = st.checkbox(
+        "Incluir PLAN_INS_DIA1 (INV + PLAN_INS_DIA1)",
+        value=False,
+        help="Suma el inventario planeado de entrada al inventario actual antes de asignar."
+    )
+
+    # ── Modo prioridad ────────────────────────────────────────────────────────
     st.markdown('<p class="section-title">Modo de prioridad</p>', unsafe_allow_html=True)
     modo = st.selectbox(
         "¿Cuál dimensión domina?",
@@ -98,6 +94,7 @@ with st.sidebar:
         help="ENTREGA: la entrega decide primero, LOTSIZE desempata. LOTSIZE: al revés. IGUAL: se suman."
     )
 
+    # ── ENTREGA ───────────────────────────────────────────────────────────────
     st.markdown('<p class="section-title">Prioridad ENTREGA</p>', unsafe_allow_html=True)
     st.markdown('<div class="tip-box">Menor número = mayor prioridad.</div>', unsafe_allow_html=True)
     entrega_pesos = {}
@@ -105,12 +102,14 @@ with st.sidebar:
         entrega_pesos[val] = st.number_input(val, min_value=1, max_value=99,
                                              value=default, key=f"e_{val}")
 
+    # ── LOTSIZE ───────────────────────────────────────────────────────────────
     st.markdown('<p class="section-title">Prioridad LOTSIZE</p>', unsafe_allow_html=True)
     lotsize_pesos = {}
     for val, default in DEFAULT_LOTSIZE.items():
         lotsize_pesos[val] = st.number_input(val, min_value=1, max_value=99,
                                              value=default, key=f"l_{val}")
 
+    # ── Cascada de color ──────────────────────────────────────────────────────
     st.markdown('<p class="section-title">Cascada de color (COLOR_A dígito 3)</p>',
                 unsafe_allow_html=True)
     st.markdown(
@@ -120,14 +119,13 @@ with st.sidebar:
     )
     cascada_activo = {}
     for digito, nombre in CASCADA_COLOR_NOMBRES.items():
-        val = st.selectbox(
+        cascada_activo[digito] = st.selectbox(
             f"{digito} — {nombre}",
             options=[1, 0],
             index=0,
             format_func=lambda x: "🟢 ACTIVO" if x == 1 else "🔴 INACTIVO",
             key=f"color_{digito}"
         )
-        cascada_activo[digito] = val
 
 # ── Funciones ─────────────────────────────────────────────────────────────────
 def leer_excel(file):
@@ -143,28 +141,33 @@ def leer_excel(file):
 
 
 def extraer_digito3(color_a):
-    """Extrae el tercer dígito (índice 2) del valor COLOR_A."""
     try:
-        s = str(int(float(color_a))) if str(color_a).replace('.','').isdigit() else str(color_a)
+        s = str(int(float(color_a))) if str(color_a).replace('.', '').isdigit() else str(color_a)
         return s[2] if len(s) >= 3 else None
     except Exception:
         return None
 
 
-def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo):
+def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_ins=False):
     df = df.copy()
     df.columns = df.columns.str.strip().str.upper()
     df = df.dropna(subset=['ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV']).reset_index(drop=True)
 
+    # ── Inventario efectivo ───────────────────────────────────────────────────
+    if usar_plan_ins and 'PLAN_INS_DIA1' in df.columns:
+        df['INV_EFECTIVO'] = df['INV'].fillna(0) + df['PLAN_INS_DIA1'].fillna(0)
+    else:
+        df['INV_EFECTIVO'] = df['INV'].fillna(0)
+
     # ── Cascada de color ──────────────────────────────────────────────────────
     if 'COLOR_A' in df.columns:
-        df['_DIGITO3']   = df['COLOR_A'].apply(extraer_digito3)
+        df['_DIGITO3']     = df['COLOR_A'].apply(extraer_digito3)
         df['COLOR_NOMBRE'] = df['_DIGITO3'].map(CASCADA_COLOR_NOMBRES).fillna('DESCONOCIDO')
-        df['ACTIVO']     = df['_DIGITO3'].map(cascada_activo).fillna(0).astype(int)
+        df['ACTIVO']       = df['_DIGITO3'].map(cascada_activo).fillna(0).astype(int)
     else:
-        df['_DIGITO3']   = None
+        df['_DIGITO3']     = None
         df['COLOR_NOMBRE'] = 'SIN COLOR_A'
-        df['ACTIVO']     = 1  # si no hay COLOR_A, todas activas
+        df['ACTIVO']       = 1
 
     # ── Pesos de prioridad ────────────────────────────────────────────────────
     df['_PESO_E'] = df['ENTREGA'].map(entrega_pesos).fillna(99).astype(int)
@@ -180,24 +183,27 @@ def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo):
 
     df['_IDX'] = range(len(df))
 
-    # Ordenar: dentro del grupo, ACTIVAS primero (por orden), luego INACTIVAS
-    df_sorted = df.sort_values(['ESTILO_EQ', 'DTITULAR', 'ACTIVO', '_ORDEN', '_IDX'],
-                               ascending=[True, True, False, True, True])
+    # ACTIVAS primero dentro del grupo, luego por orden de prioridad
+    df_sorted = df.sort_values(
+        ['ESTILO_EQ', 'DTITULAR', 'ACTIVO', '_ORDEN', '_IDX'],
+        ascending=[True, True, False, True, True]
+    )
 
+    # ── Asignación acumulativa ────────────────────────────────────────────────
     lbs_asignado, inv_restante_col = [], []
 
     for _, grupo in df_sorted.groupby(['ESTILO_EQ', 'DTITULAR'], sort=False):
-        inv_disp  = grupo['INV'].iloc[0]
+        inv_disp  = grupo['INV_EFECTIVO'].iloc[0]
         acumulado = 0
         for _, fila in grupo.iterrows():
-            lbs_c   = fila['LBS_C']
-            activo  = fila['ACTIVO']
+            lbs_c  = fila['LBS_C']
+            activo = fila['ACTIVO']
             if activo == 1:
                 disponible = max(0, inv_disp - acumulado)
                 asignado   = min(lbs_c, disponible)
                 acumulado += lbs_c
             else:
-                asignado   = 0   # INACTIVA: no recibe nada, no consume inventario
+                asignado = 0  # no recibe y no consume inventario
             lbs_asignado.append(asignado)
             inv_restante_col.append(max(0, inv_disp - acumulado))
 
@@ -210,51 +216,42 @@ def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo):
         df_sorted['LBS_ASIGNADO'] / df_sorted['LBS_C'].replace(0, np.nan)
     ).fillna(0)
 
-    # STATUS a nivel DISPO: completa solo si TODAS las líneas ACTIVAS están al 100%
-    # Las INACTIVAS no cuentan para el STATUS
+    # STATUS a nivel DISPO — evalúa solo líneas ACTIVAS
     activas_mask = df_sorted['ACTIVO'] == 1
-
-    # Para cada DISPO: mínimo PCT entre las líneas activas
-    pct_activas = df_sorted[activas_mask].groupby('DISPO')['PCT_LINEA'].min().rename('_min_pct_activas')
-    df_sorted   = df_sorted.merge(pct_activas, on='DISPO', how='left')
-
-    # Si una DISPO no tiene ninguna línea activa, marcarla especial
-    df_sorted['_min_pct_activas'] = df_sorted['_min_pct_activas'].fillna(-1)
+    pct_activas  = df_sorted[activas_mask].groupby('DISPO')['PCT_LINEA'].min().rename('_min_pct')
+    df_sorted    = df_sorted.merge(pct_activas, on='DISPO', how='left')
+    df_sorted['_min_pct'] = df_sorted['_min_pct'].fillna(-1)
 
     def status_dispo(row):
         if row['ACTIVO'] == 0:
             return '⛔ INACTIVA'
-        p = row['_min_pct_activas']
-        if p < 0:
-            return '⛔ INACTIVA'
-        if p >= 1:
-            return '✅ COMPLETA'
-        if p > 0:
-            return '⚠️ PARCIAL'
+        p = row['_min_pct']
+        if p < 0:   return '⛔ INACTIVA'
+        if p >= 1:  return '✅ COMPLETA'
+        if p > 0:   return '⚠️ PARCIAL'
         return '❌ SIN INVENTARIO'
 
     df_sorted['STATUS_DISPO'] = df_sorted.apply(status_dispo, axis=1)
 
-    # PCT a nivel DISPO (solo líneas activas)
-    dispo_lbs_c_act  = df_sorted[activas_mask].groupby('DISPO')['LBS_C'].sum()
-    dispo_lbs_asig   = df_sorted[activas_mask].groupby('DISPO')['LBS_ASIGNADO'].sum()
-    pct_dispo        = (dispo_lbs_asig / dispo_lbs_c_act.replace(0, np.nan)).fillna(0).rename('PCT_DISPO')
-    df_sorted        = df_sorted.merge(pct_dispo, on='DISPO', how='left')
+    # PCT a nivel DISPO (solo activas)
+    dispo_lbs_c  = df_sorted[activas_mask].groupby('DISPO')['LBS_C'].sum()
+    dispo_lbs_a  = df_sorted[activas_mask].groupby('DISPO')['LBS_ASIGNADO'].sum()
+    pct_dispo    = (dispo_lbs_a / dispo_lbs_c.replace(0, np.nan)).fillna(0).rename('PCT_DISPO')
+    df_sorted    = df_sorted.merge(pct_dispo, on='DISPO', how='left')
     df_sorted['PCT_DISPO'] = df_sorted['PCT_DISPO'].fillna(0)
 
-    return df_sorted.sort_values('_IDX').drop(
-        columns=['_PESO_E', '_PESO_L', '_ORDEN', '_IDX', '_DIGITO3', '_min_pct_activas']
-    )
+    drop_cols = ['_PESO_E', '_PESO_L', '_ORDEN', '_IDX', '_DIGITO3', '_min_pct']
+    return df_sorted.sort_values('_IDX').drop(columns=drop_cols)
 
 
-def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo):
-    COLOR_H_ORIG  = '2F4F7F'
-    COLOR_H_NEW   = '1D6A40'
-    COLOR_H_CFG   = '7B3F00'
-    COLOR_OK      = 'C6EFCE'
-    COLOR_WARN    = 'FFEB9C'
-    COLOR_ERR     = 'FFC7CE'
-    COLOR_INACT   = 'E5E7EB'
+def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo, usar_plan_ins):
+    COLOR_H_ORIG = '2F4F7F'
+    COLOR_H_NEW  = '1D6A40'
+    COLOR_H_CFG  = '7B3F00'
+    COLOR_OK     = 'C6EFCE'
+    COLOR_WARN   = 'FFEB9C'
+    COLOR_ERR    = 'FFC7CE'
+    COLOR_INACT  = 'E5E7EB'
     FW  = Font(color='FFFFFF', bold=True, name='Arial', size=10)
     FN  = Font(name='Arial', size=9)
     FB  = Font(name='Arial', size=9, bold=True)
@@ -262,19 +259,19 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo)
     thin = Side(style='thin', color='CCCCCC')
     brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    new_cols  = ['COLOR_NOMBRE', 'ACTIVO', 'LBS_ASIGNADO', 'LBS_FALTANTE',
-                 'INV_RESTANTE', 'PCT_LINEA', 'PCT_DISPO', 'STATUS_DISPO']
+    new_cols  = ['COLOR_NOMBRE', 'ACTIVO', 'INV_EFECTIVO',
+                 'LBS_ASIGNADO', 'LBS_FALTANTE', 'INV_RESTANTE',
+                 'PCT_LINEA', 'PCT_DISPO', 'STATUS_DISPO']
     orig_cols = [c for c in df_result.columns if c not in new_cols]
     df_out    = df_result[orig_cols + [c for c in new_cols if c in df_result.columns]].copy()
 
-    # KPIs a nivel DISPO (solo activas)
-    activas   = df_result[df_result['ACTIVO'] == 1]
-    dispo_min = activas.groupby('DISPO')['PCT_LINEA'].min()
-    total_d   = dispo_min.count()
-    completas = (dispo_min >= 1).sum()
-    parciales = ((dispo_min > 0) & (dispo_min < 1)).sum()
-    sin_inv   = (dispo_min == 0).sum()
-    inactivas_lineas = (df_result['ACTIVO'] == 0).sum()
+    activas    = df_result[df_result['ACTIVO'] == 1]
+    dispo_min  = activas.groupby('DISPO')['PCT_LINEA'].min()
+    total_d    = dispo_min.count()
+    completas  = (dispo_min >= 1).sum()
+    parciales  = ((dispo_min > 0) & (dispo_min < 1)).sum()
+    sin_inv    = (dispo_min == 0).sum()
+    inac_lines = (df_result['ACTIVO'] == 0).sum()
     cob_global = activas['LBS_ASIGNADO'].sum() / activas['LBS_C'].sum() if len(activas) else 0
 
     cfg_cascada = pd.DataFrame([
@@ -292,19 +289,21 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo)
                 'DISPOs totales (activas)', '✅ DISPOs completas', '⚠️ DISPOs parciales',
                 '❌ DISPOs sin inventario', 'Líneas inactivas (excluidas)',
                 'LBS necesarias (activas)', 'LBS asignadas', 'LBS faltantes',
-                '% Cobertura global (LBS activas)', 'Modo prioridad', 'Generado'
+                '% Cobertura global (LBS activas)',
+                'Inventario usado', 'Modo prioridad', 'Generado'
             ],
             'Valor': [
-                total_d, completas, parciales, sin_inv, inactivas_lineas,
+                total_d, completas, parciales, sin_inv, inac_lines,
                 round(activas['LBS_C'].sum(), 1),
                 round(activas['LBS_ASIGNADO'].sum(), 1),
                 round(activas['LBS_FALTANTE'].sum(), 1),
-                f'{cob_global:.1%}', modo,
+                f'{cob_global:.1%}',
+                'INV + PLAN_INS_DIA1' if usar_plan_ins else 'Solo INV',
+                modo,
                 datetime.now().strftime('%Y-%m-%d %H:%M')
             ]
         }).to_excel(writer, sheet_name='RESUMEN', index=False)
 
-        # CONFIG — prioridades + cascada
         cfg_e = pd.DataFrame(list(entrega_pesos.items()), columns=['ENTREGA', 'PESO'])
         cfg_l = pd.DataFrame(list(lotsize_pesos.items()), columns=['LOTSIZE', 'PESO'])
         cfg_e.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=0)
@@ -330,7 +329,6 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo)
     s_idx  = df_out.columns.get_loc('STATUS_DISPO') + 1
     pl_idx = df_out.columns.get_loc('PCT_LINEA') + 1
     pd_idx = df_out.columns.get_loc('PCT_DISPO') + 1
-    a_idx  = df_out.columns.get_loc('ACTIVO') + 1 if 'ACTIVO' in df_out.columns else None
 
     f_ok   = PatternFill('solid', start_color=COLOR_OK)
     f_warn = PatternFill('solid', start_color=COLOR_WARN)
@@ -338,11 +336,11 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo)
     f_inac = PatternFill('solid', start_color=COLOR_INACT)
 
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        status = row[s_idx - 1].value
+        status  = row[s_idx - 1].value
         is_inac = status == '⛔ INACTIVA'
-        fill = (f_inac if is_inac else
-                f_ok   if status == '✅ COMPLETA' else
-                f_warn if status == '⚠️ PARCIAL' else f_err)
+        fill    = (f_inac if is_inac else
+                   f_ok   if status == '✅ COMPLETA' else
+                   f_warn if status == '⚠️ PARCIAL' else f_err)
         for cell in row:
             cell.font   = FI if is_inac else FN
             cell.border = brd
@@ -354,9 +352,9 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo)
 
     for i, col_name in enumerate(df_out.columns, 1):
         w = (18 if col_name in ('DISPO','ESTILO_EQ','ENTREGA','LOTSIZE','STATUS_DISPO','COLOR_NOMBRE')
-             else 14 if col_name in ('LBS_C','LBS_ASIGNADO','LBS_FALTANTE','INV','INV_RESTANTE')
+             else 14 if col_name in ('LBS_C','LBS_ASIGNADO','LBS_FALTANTE','INV','INV_EFECTIVO','INV_RESTANTE','PLAN_INS_DIA1')
              else 12 if col_name in ('PCT_LINEA','PCT_DISPO')
-             else 9  if col_name == 'ACTIVO'
+             else  9 if col_name == 'ACTIVO'
              else 11)
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -374,14 +372,13 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo)
     # ── Formatear CONFIG ──────────────────────────────────────────────────────
     ws_c = wb['CONFIG']
     titulos = {1: 'PRIORIDAD ENTREGA', 4: 'PRIORIDAD LOTSIZE', 7: 'CASCADA DE COLOR'}
-    merges  = ['A1:B1', 'D1:E1', 'G1:I1']
     for col_start, titulo in titulos.items():
         cell = ws_c.cell(row=1, column=col_start)
         cell.value     = titulo
         cell.fill      = PatternFill('solid', start_color=COLOR_H_CFG)
         cell.font      = FW
         cell.alignment = Alignment(horizontal='center')
-    for m in merges:
+    for m in ['A1:B1', 'D1:E1', 'G1:I1']:
         ws_c.merge_cells(m)
     for col in ['A','B','D','E','G','H','I']:
         ws_c.column_dimensions[col].width = 16
@@ -413,20 +410,25 @@ with col_upload:
         if df_raw is None:
             st.error("No se encontraron los encabezados. Verifica el archivo.")
         else:
-            st.success(f"**{uploaded.name}**")
+            tiene_color    = 'COLOR_A'   in df_raw.columns
+            tiene_plan_ins = 'PLAN_INS_DIA1'  in df_raw.columns
 
-            tiene_color = 'COLOR_A' in df_raw.columns
+            st.success(f"**{uploaded.name}**")
             st.caption(
                 f"{len(df_raw):,} filas · {df_raw['DISPO'].nunique():,} dispos · "
-                f"fila encabezado {header_row + 1} · "
-                f"{'✅ COLOR_A detectado' if tiene_color else '⚠️ Sin COLOR_A'}"
+                f"fila encabezado {header_row + 1}"
             )
 
+            # Avisos de columnas opcionales
             if not tiene_color:
                 st.markdown(
-                    '<div class="warn-box">No se encontró la columna COLOR_A. '
-                    'La cascada de color no aplicará y todas las líneas serán ACTIVAS.</div>',
-                    unsafe_allow_html=True
+                    '<div class="warn-box">⚠️ Sin columna COLOR_A — '
+                    'todas las líneas serán ACTIVAS.</div>', unsafe_allow_html=True
+                )
+            if usar_plan_ins and not tiene_plan_ins:
+                st.markdown(
+                    '<div class="warn-box">⚠️ Activaste PLAN_INS_DIA1 pero el archivo '
+                    'no tiene esa columna — se usará solo INV.</div>', unsafe_allow_html=True
                 )
 
             cols_faltantes = [c for c in ['ENTREGA','DISPO','ESTILO_EQ','DTITULAR','LBS_C','INV']
@@ -435,7 +437,8 @@ with col_upload:
                 st.warning(f"Columnas faltantes: {cols_faltantes}")
             else:
                 preview_cols = [c for c in ['DISPO','ENTREGA','ESTILO_EQ','DTITULAR',
-                                            'COLOR_A','LBS_C','INV'] if c in df_raw.columns]
+                                            'COLOR_A','LBS_C','INV','PLAN_INS_DIA1']
+                                if c in df_raw.columns]
                 st.markdown('<p class="section-title">Vista previa</p>', unsafe_allow_html=True)
                 st.dataframe(df_raw[preview_cols].head(8),
                              use_container_width=True, hide_index=True)
@@ -443,9 +446,11 @@ with col_upload:
                 if st.button("▶ Procesar", type="primary", use_container_width=True):
                     with st.spinner("Calculando asignación..."):
                         st.session_state['df_result'] = procesar(
-                            df_raw, entrega_pesos, lotsize_pesos, modo, cascada_activo
+                            df_raw, entrega_pesos, lotsize_pesos,
+                            modo, cascada_activo, usar_plan_ins
                         )
-                        st.session_state['modo'] = modo
+                        st.session_state['modo']         = modo
+                        st.session_state['usar_plan_ins'] = usar_plan_ins
 
 with col_main:
     if 'df_result' in st.session_state:
@@ -459,6 +464,7 @@ with col_main:
         sin_inv    = (dispo_min == 0).sum()
         inac_lines = (df_r['ACTIVO'] == 0).sum()
         cob        = activas['LBS_ASIGNADO'].sum() / activas['LBS_C'].sum() if len(activas) else 0
+        inv_label  = 'INV + PLAN_INS_DIA1' if st.session_state.get('usar_plan_ins') else 'Solo INV'
 
         st.markdown('<p class="section-title">Resumen de asignación — por DISPO (líneas activas)</p>',
                     unsafe_allow_html=True)
@@ -482,7 +488,7 @@ with col_main:
             <div class="kpi-card blue">
                 <div class="kpi-label">📦 Cobertura LBS</div>
                 <div class="kpi-value">{cob:.1%}</div>
-                <div class="kpi-sub">Modo: {st.session_state['modo']}</div>
+                <div class="kpi-sub">{inv_label} · Modo: {st.session_state['modo']}</div>
             </div>
             <div class="kpi-card gray">
                 <div class="kpi-label">⛔ Líneas inactivas</div>
@@ -538,7 +544,8 @@ with col_main:
 
         cols_show = ['DISPO','ENTREGA','ESTILO_EQ','DTITULAR',
                      'COLOR_NOMBRE','ACTIVO',
-                     'LBS_C','INV','LBS_ASIGNADO','LBS_FALTANTE',
+                     'LBS_C','INV','INV_EFECTIVO',
+                     'LBS_ASIGNADO','LBS_FALTANTE',
                      'PCT_LINEA','PCT_DISPO','STATUS_DISPO']
         if 'LOTSIZE' in df_r.columns:
             cols_show.insert(2, 'LOTSIZE')
@@ -551,17 +558,18 @@ with col_main:
                 'LBS_C':        '{:,.1f}',
                 'LBS_ASIGNADO': '{:,.1f}',
                 'LBS_FALTANTE': '{:,.1f}',
+                'INV_EFECTIVO': '{:,.0f}',
             }),
             use_container_width=True, hide_index=True, height=420
         )
-        st.caption(
-            f"Mostrando {len(df_vis):,} líneas · {df_vis['DISPO'].nunique():,} dispos"
-        )
+        st.caption(f"Mostrando {len(df_vis):,} líneas · {df_vis['DISPO'].nunique():,} dispos")
 
         st.markdown('<p class="section-title">Descargar resultado</p>', unsafe_allow_html=True)
         ts = datetime.now().strftime('%Y%m%d%H%M')
         excel_bytes = generar_excel(
-            df_r, entrega_pesos, lotsize_pesos, cascada_activo, st.session_state['modo']
+            df_r, entrega_pesos, lotsize_pesos,
+            cascada_activo, modo,
+            st.session_state.get('usar_plan_ins', False)
         )
         st.download_button(
             label=f"⬇️  Descargar Excel — INVENTARIO_DISPOS_{ts}.xlsx",
