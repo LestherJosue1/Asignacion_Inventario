@@ -66,7 +66,7 @@ DEFAULT_ENTREGA = {
 }
 DEFAULT_LOTSIZE = {
     'C-2600': 1, 'D-2200': 2, 'B-3300': 3, 'A-4000': 4, 'F-1000': 5,
-    }
+}
 CASCADA_COLOR_NOMBRES = {
     '0': 'BLANCO',   '1': 'AMARILLO', '2': 'NARANJA', '3': 'ROJO',
     '4': 'MORADO',   '5': 'ROYAL',    '6': 'VERDE',   '7': 'CAFÉ',
@@ -243,6 +243,115 @@ def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_i
     return df_sorted.sort_values('_IDX').drop(columns=drop_cols)
 
 
+
+def generar_reporte(df_result):
+    """Genera la hoja REPORTE con los 4 cuadros solicitados."""
+    completas = df_result[
+        (df_result['STATUS_DISPO'] == '✅ COMPLETA') & (df_result['ACTIVO'] == 1)
+    ]
+
+    # Cuadro 1: STATUS COMPLETA — LBS_C por ENTREGA
+    c1 = completas.groupby('ENTREGA')['LBS_C'].sum().reset_index()
+    c1.columns = ['ENTREGA', 'LBS_C']
+    c1 = c1.sort_values('LBS_C', ascending=False)
+    c1.loc[len(c1)] = ['TOTAL', c1['LBS_C'].sum()]
+
+    # Cuadro 2: STATUS COMPLETA — LBS_C por LOTSIZE
+    if 'LOTSIZE' in completas.columns:
+        c2 = completas.groupby('LOTSIZE')['LBS_C'].sum().reset_index()
+        c2.columns = ['LOTSIZE', 'LBS_C']
+        c2 = c2.sort_values('LBS_C', ascending=False)
+        c2.loc[len(c2)] = ['TOTAL', c2['LBS_C'].sum()]
+    else:
+        c2 = pd.DataFrame({'LOTSIZE': ['Sin datos'], 'LBS_C': [0]})
+
+    # Cuadro 3: STATUS COMPLETA — LBS_C por COLOR_NOMBRE
+    if 'COLOR_NOMBRE' in completas.columns:
+        c3 = completas.groupby('COLOR_NOMBRE')['LBS_C'].sum().reset_index()
+        c3.columns = ['COLOR_NOMBRE', 'LBS_C']
+        c3 = c3.sort_values('LBS_C', ascending=False)
+        c3.loc[len(c3)] = ['TOTAL', c3['LBS_C'].sum()]
+    else:
+        c3 = pd.DataFrame({'COLOR_NOMBRE': ['Sin datos'], 'LBS_C': [0]})
+
+    # Cuadro 4: Resumen por ENTREGA - LOTSIZE - DISPO - ESTILO_EQ - DTITULAR - LBS_C
+    group_cols = [c for c in ['ENTREGA', 'LOTSIZE', 'DISPO', 'ESTILO_EQ', 'DTITULAR']
+                  if c in df_result.columns]
+    c4 = df_result[df_result['ACTIVO'] == 1].groupby(group_cols, dropna=False)['LBS_C'].sum().reset_index()
+    c4 = c4.sort_values(['ENTREGA', 'LBS_C'], ascending=[True, False])
+
+    return c1, c2, c3, c4
+
+
+def escribir_reporte_excel(ws, c1, c2, c3, c4, FW, FN, FB, brd,
+                            COLOR_H_ORIG, COLOR_H_NEW, COLOR_H_CFG):
+    """Escribe los 4 cuadros en la hoja REPORTE."""
+    COLOR_TOTAL = 'D1FAE5'
+    ft_total = Font(name='Arial', size=9, bold=True, color='065F46')
+
+    def write_table(ws, title, df, start_row, start_col, header_color):
+        # Título del cuadro
+        title_cell = ws.cell(row=start_row, column=start_col, value=title)
+        title_cell.font = FW
+        title_cell.fill = PatternFill('solid', start_color=header_color)
+        title_cell.alignment = Alignment(horizontal='center', vertical='center')
+        title_cell.border = brd
+        end_col = start_col + len(df.columns) - 1
+        if end_col > start_col:
+            ws.merge_cells(
+                start_row=start_row, start_column=start_col,
+                end_row=start_row, end_column=end_col
+            )
+
+        # Headers
+        for ci, col_name in enumerate(df.columns, start=start_col):
+            c = ws.cell(row=start_row + 1, column=ci, value=col_name)
+            c.font = FB
+            c.fill = PatternFill('solid', start_color='D9D9D9')
+            c.alignment = Alignment(horizontal='center')
+            c.border = brd
+
+        # Datos
+        for ri, (_, row_data) in enumerate(df.iterrows(), start=start_row + 2):
+            is_total = any(str(v).upper() == 'TOTAL' for v in row_data.values)
+            for ci, val in enumerate(row_data.values, start=start_col):
+                cell = ws.cell(row=ri, column=ci, value=val)
+                cell.border = brd
+                if is_total:
+                    cell.font = ft_total
+                    cell.fill = PatternFill('solid', start_color=COLOR_TOTAL)
+                    cell.alignment = Alignment(horizontal='center')
+                else:
+                    cell.font = FN
+                    if isinstance(val, (int, float)):
+                        cell.number_format = '#,##0.0'
+                        cell.alignment = Alignment(horizontal='right')
+
+        return start_row + len(df) + 3  # siguiente fila disponible
+
+    # ── Cuadro 1 (col A) ─────────────────────────────────────────────────────
+    next_row = write_table(ws, '📋 Cuadro 1 — Completas por ENTREGA',
+                           c1, 1, 1, COLOR_H_ORIG)
+
+    # ── Cuadro 2 (col A, debajo de Cuadro 1) ─────────────────────────────────
+    next_row = write_table(ws, '📋 Cuadro 2 — Completas por LOTSIZE',
+                           c2, next_row, 1, COLOR_H_ORIG)
+
+    # ── Cuadro 3 (col A, debajo de Cuadro 2) ─────────────────────────────────
+    write_table(ws, '📋 Cuadro 3 — Completas por COLOR',
+                c3, next_row, 1, COLOR_H_ORIG)
+
+    # ── Cuadro 4 (col E) — Resumen detallado ─────────────────────────────────
+    write_table(ws, '📋 Cuadro 4 — Resumen por ENTREGA / LOTSIZE / DISPO / ESTILO / TITULAR',
+                c4, 1, 5, COLOR_H_NEW)
+
+    # Anchos
+    for col in ['A', 'B', 'C']:
+        ws.column_dimensions[col].width = 18
+    ws.column_dimensions['D'].width = 4
+    for col in ['E', 'F', 'G', 'H', 'I', 'J']:
+        ws.column_dimensions[col].width = 16
+
 def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo, usar_plan_ins):
     COLOR_H_ORIG = '2F4F7F'
     COLOR_H_NEW  = '1D6A40'
@@ -308,6 +417,9 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo,
         cfg_e.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=0)
         cfg_l.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=3)
         cfg_cascada.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=6)
+
+        # Hoja REPORTE — placeholder (se llena después con openpyxl)
+        pd.DataFrame().to_excel(writer, sheet_name='REPORTE', index=False)
 
     buf.seek(0)
     wb = load_workbook(buf)
@@ -389,6 +501,13 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo,
             cell.border = brd
             if cell.row == 2:
                 cell.fill = PatternFill('solid', start_color='D9D9D9')
+
+    # ── Escribir REPORTE ─────────────────────────────────────────────────────
+    ws_rep = wb['REPORTE']
+    c1, c2, c3, c4 = generar_reporte(df_result)
+    escribir_reporte_excel(ws_rep, c1, c2, c3, c4,
+                           FW, FN, FB, brd,
+                           COLOR_H_ORIG, COLOR_H_NEW, COLOR_H_CFG)
 
     out = io.BytesIO()
     wb.save(out)
