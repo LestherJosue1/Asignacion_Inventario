@@ -75,12 +75,6 @@ st.markdown("""
         background: linear-gradient(135deg, #1a2f4e, #0d4f3c);
         color: white;
     }
-    .download-btn > button {
-        background: #16a34a !important;
-        color: white !important;
-        width: 100%;
-        padding: 0.7rem !important;
-    }
 
     .tip-box {
         background: #f8fafc;
@@ -98,7 +92,7 @@ st.markdown("""
 st.markdown("""
 <div class="app-header">
     <h1>📦 Completación de Dispos</h1>
-    <p>Asignación de inventario con prioridad configurable · Llave: ESTILO_EQ + DTITULAR</p>
+    <p>Asignación de inventario con prioridad configurable · Llave: ESTILO_EQ + DTITULAR · Una DISPO es completa solo si TODAS sus líneas están al 100%</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -158,13 +152,14 @@ def leer_excel(file):
             continue
     return None, None
 
+
 def procesar(df, entrega_pesos, lotsize_pesos, modo):
     df = df.copy()
     df.columns = df.columns.str.strip().str.upper()
     df = df.dropna(subset=['ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV']).reset_index(drop=True)
 
     df['_PESO_E'] = df['ENTREGA'].map(entrega_pesos).fillna(99).astype(int)
-    df['_PESO_L'] = df.get('LOTSIZE', pd.Series(99, index=df.index)).map(lotsize_pesos).fillna(99).astype(int) \
+    df['_PESO_L'] = df['LOTSIZE'].map(lotsize_pesos).fillna(99).astype(int) \
                    if 'LOTSIZE' in df.columns else 99
 
     if modo == 'ENTREGA':
@@ -191,12 +186,25 @@ def procesar(df, entrega_pesos, lotsize_pesos, modo):
     df_sorted['LBS_ASIGNADO'] = lbs_asignado
     df_sorted['INV_RESTANTE'] = inv_restante_col
     df_sorted['LBS_FALTANTE'] = (df_sorted['LBS_C'] - df_sorted['LBS_ASIGNADO']).clip(lower=0)
-    df_sorted['PCT_CUBIERTO'] = (df_sorted['LBS_ASIGNADO'] / df_sorted['LBS_C'].replace(0, np.nan)).fillna(0)
-    df_sorted['STATUS_DISPO'] = df_sorted['PCT_CUBIERTO'].apply(
+
+    # PCT por línea
+    df_sorted['PCT_LINEA'] = (
+        df_sorted['LBS_ASIGNADO'] / df_sorted['LBS_C'].replace(0, np.nan)
+    ).fillna(0)
+
+    # STATUS a nivel DISPO: completa solo si TODAS las líneas están al 100%
+    dispo_min_pct = df_sorted.groupby('DISPO')['PCT_LINEA'].transform('min')
+    df_sorted['STATUS_DISPO'] = dispo_min_pct.apply(
         lambda p: '✅ COMPLETA' if p >= 1 else ('⚠️ PARCIAL' if p > 0 else '❌ SIN INVENTARIO')
     )
 
+    # PCT a nivel DISPO (para referencia y KPIs)
+    dispo_lbs_c      = df_sorted.groupby('DISPO')['LBS_C'].transform('sum')
+    dispo_lbs_asig   = df_sorted.groupby('DISPO')['LBS_ASIGNADO'].transform('sum')
+    df_sorted['PCT_DISPO'] = (dispo_lbs_asig / dispo_lbs_c.replace(0, np.nan)).fillna(0)
+
     return df_sorted.sort_values('_IDX').drop(columns=['_PESO_E', '_PESO_L', '_ORDEN', '_IDX'])
+
 
 def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
     COLOR_H_ORIG = '2F4F7F'
@@ -211,30 +219,34 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
     thin = Side(style='thin', color='CCCCCC')
     brd  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    new_cols  = ['LBS_ASIGNADO', 'LBS_FALTANTE', 'INV_RESTANTE', 'PCT_CUBIERTO', 'STATUS_DISPO']
+    new_cols  = ['LBS_ASIGNADO', 'LBS_FALTANTE', 'INV_RESTANTE',
+                 'PCT_LINEA', 'PCT_DISPO', 'STATUS_DISPO']
     orig_cols = [c for c in df_result.columns if c not in new_cols]
     df_out    = df_result[orig_cols + new_cols].copy()
+
+    # KPIs a nivel DISPO
+    dispo_min = df_result.groupby('DISPO')['PCT_LINEA'].min()
+    total      = dispo_min.count()
+    completas  = (dispo_min >= 1).sum()
+    parciales  = ((dispo_min > 0) & (dispo_min < 1)).sum()
+    sin_inv    = (dispo_min == 0).sum()
+    cob_global = df_result['LBS_ASIGNADO'].sum() / df_result['LBS_C'].sum()
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
         df_out.to_excel(writer, sheet_name='DETALLE', index=False)
 
-        total      = len(df_result)
-        completas  = (df_result['PCT_CUBIERTO'] >= 1).sum()
-        parciales  = ((df_result['PCT_CUBIERTO'] > 0) & (df_result['PCT_CUBIERTO'] < 1)).sum()
-        sin_inv    = (df_result['PCT_CUBIERTO'] == 0).sum()
-        cob_global = df_result['LBS_ASIGNADO'].sum() / df_result['LBS_C'].sum()
-
         pd.DataFrame({
-            'Métrica': ['Total filas', '✅ Completas', '⚠️ Parciales', '❌ Sin inventario',
+            'Métrica': ['DISPOs totales', '✅ DISPOs completas', '⚠️ DISPOs parciales',
+                        '❌ DISPOs sin inventario',
                         'LBS necesarias', 'LBS asignadas', 'LBS faltantes',
-                        '% Cobertura global', 'Modo prioridad', 'Generado'],
-            'Valor':   [total, completas, parciales, sin_inv,
-                        round(df_result['LBS_C'].sum(), 1),
-                        round(df_result['LBS_ASIGNADO'].sum(), 1),
-                        round(df_result['LBS_FALTANTE'].sum(), 1),
-                        f'{cob_global:.1%}', modo,
-                        datetime.now().strftime('%Y-%m-%d %H:%M')]
+                        '% Cobertura global (LBS)', 'Modo prioridad', 'Generado'],
+            'Valor': [total, completas, parciales, sin_inv,
+                      round(df_result['LBS_C'].sum(), 1),
+                      round(df_result['LBS_ASIGNADO'].sum(), 1),
+                      round(df_result['LBS_FALTANTE'].sum(), 1),
+                      f'{cob_global:.1%}', modo,
+                      datetime.now().strftime('%Y-%m-%d %H:%M')]
         }).to_excel(writer, sheet_name='RESUMEN', index=False)
 
         cfg_e = pd.DataFrame(list(entrega_pesos.items()), columns=['ENTREGA', 'PESO'])
@@ -245,7 +257,7 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
     buf.seek(0)
     wb = load_workbook(buf)
 
-    # Formatear DETALLE
+    # ── Formatear DETALLE ─────────────────────────────────────────────────────
     ws = wb['DETALLE']
     n_orig = len(orig_cols)
     for col_idx in range(1, len(df_out.columns) + 1):
@@ -258,11 +270,12 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
     ws.freeze_panes = 'A2'
     ws.auto_filter.ref = ws.dimensions
 
-    s_idx = df_out.columns.get_loc('STATUS_DISPO') + 1
-    p_idx = df_out.columns.get_loc('PCT_CUBIERTO') + 1
-    f_ok  = PatternFill('solid', start_color=COLOR_OK)
-    f_warn= PatternFill('solid', start_color=COLOR_WARN)
-    f_err = PatternFill('solid', start_color=COLOR_ERR)
+    s_idx  = df_out.columns.get_loc('STATUS_DISPO') + 1
+    pl_idx = df_out.columns.get_loc('PCT_LINEA') + 1
+    pd_idx = df_out.columns.get_loc('PCT_DISPO') + 1
+    f_ok   = PatternFill('solid', start_color=COLOR_OK)
+    f_warn = PatternFill('solid', start_color=COLOR_WARN)
+    f_err  = PatternFill('solid', start_color=COLOR_ERR)
 
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         status = row[s_idx - 1].value
@@ -273,18 +286,19 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
             if cell.column > n_orig:
                 cell.fill = fill
                 cell.alignment = Alignment(horizontal='center')
-        row[p_idx - 1].number_format = '0.0%'
+        row[pl_idx - 1].number_format = '0.0%'
+        row[pd_idx - 1].number_format = '0.0%'
 
     for i, col_name in enumerate(df_out.columns, 1):
-        w = 18 if col_name in ('DISPO','ESTILO_EQ','ENTREGA','LOTSIZE','STATUS_DISPO') \
-            else 14 if col_name in ('LBS_C','LBS_ASIGNADO','LBS_FALTANTE','INV','INV_RESTANTE') \
-            else 12 if col_name == 'PCT_CUBIERTO' else 11
+        w = 18 if col_name in ('DISPO', 'ESTILO_EQ', 'ENTREGA', 'LOTSIZE', 'STATUS_DISPO') \
+            else 14 if col_name in ('LBS_C', 'LBS_ASIGNADO', 'LBS_FALTANTE', 'INV', 'INV_RESTANTE') \
+            else 12 if col_name in ('PCT_LINEA', 'PCT_DISPO') else 11
         ws.column_dimensions[get_column_letter(i)].width = w
 
-    # Formatear RESUMEN
+    # ── Formatear RESUMEN ─────────────────────────────────────────────────────
     ws_r = wb['RESUMEN']
-    ws_r.column_dimensions['A'].width = 26
-    ws_r.column_dimensions['B'].width = 20
+    ws_r.column_dimensions['A'].width = 28
+    ws_r.column_dimensions['B'].width = 22
     for row in ws_r.iter_rows(min_row=1, max_row=ws_r.max_row):
         for cell in row:
             cell.border = brd
@@ -292,7 +306,7 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
             if cell.row == 1:
                 cell.fill = PatternFill('solid', start_color=COLOR_H_ORIG)
 
-    # Formatear CONFIG
+    # ── Formatear CONFIG ──────────────────────────────────────────────────────
     ws_c = wb['CONFIG']
     ws_c['A1'] = 'PRIORIDAD ENTREGA'
     ws_c['D1'] = 'PRIORIDAD LOTSIZE'
@@ -302,7 +316,7 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
         cell.alignment = Alignment(horizontal='center')
     ws_c.merge_cells('A1:B1')
     ws_c.merge_cells('D1:E1')
-    for col in ['A','B','D','E']:
+    for col in ['A', 'B', 'D', 'E']:
         ws_c.column_dimensions[col].width = 16
     ws_c.column_dimensions['C'].width = 4
     for row in ws_c.iter_rows(min_row=2, max_row=ws_c.max_row):
@@ -317,12 +331,14 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, modo):
     out.seek(0)
     return out
 
+
 # ── Layout principal ──────────────────────────────────────────────────────────
 col_upload, col_main = st.columns([1, 2.5], gap="large")
 
 with col_upload:
     st.markdown('<p class="section-title">Archivo de entrada</p>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("Sube tu archivo Excel", type=['xlsx','xls'], label_visibility="collapsed")
+    uploaded = st.file_uploader("Sube tu archivo Excel", type=['xlsx', 'xls'],
+                                label_visibility="collapsed")
 
     if uploaded:
         df_raw, header_row = leer_excel(uploaded)
@@ -330,53 +346,62 @@ with col_upload:
             st.error("No se encontraron los encabezados. Verifica el archivo.")
         else:
             st.success(f"**{uploaded.name}**")
-            st.caption(f"{len(df_raw):,} filas · {df_raw['DISPO'].nunique():,} dispos · encabezados en fila {header_row + 1}")
+            st.caption(
+                f"{len(df_raw):,} filas · {df_raw['DISPO'].nunique():,} dispos · "
+                f"encabezados en fila {header_row + 1}"
+            )
 
-            cols_faltantes = [c for c in ['ENTREGA','DISPO','ESTILO_EQ','DTITULAR','LBS_C','INV']
+            cols_faltantes = [c for c in ['ENTREGA', 'DISPO', 'ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV']
                               if c not in df_raw.columns]
             if cols_faltantes:
                 st.warning(f"Columnas faltantes: {cols_faltantes}")
             else:
                 st.markdown('<p class="section-title">Vista previa</p>', unsafe_allow_html=True)
                 st.dataframe(
-                    df_raw[['DISPO','ENTREGA','ESTILO_EQ','DTITULAR','LBS_C','INV']].head(8),
+                    df_raw[['DISPO', 'ENTREGA', 'ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV']].head(8),
                     use_container_width=True, hide_index=True
                 )
 
                 if st.button("▶ Procesar", type="primary", use_container_width=True):
                     with st.spinner("Calculando asignación..."):
-                        st.session_state['df_result'] = procesar(df_raw, entrega_pesos, lotsize_pesos, modo)
+                        st.session_state['df_result'] = procesar(
+                            df_raw, entrega_pesos, lotsize_pesos, modo
+                        )
                         st.session_state['modo'] = modo
 
 with col_main:
     if 'df_result' in st.session_state:
-        df_r = st.session_state['df_result']
-        total     = len(df_r)
-        completas = (df_r['PCT_CUBIERTO'] >= 1).sum()
-        parciales = ((df_r['PCT_CUBIERTO'] > 0) & (df_r['PCT_CUBIERTO'] < 1)).sum()
-        sin_inv   = (df_r['PCT_CUBIERTO'] == 0).sum()
+        df_r  = st.session_state['df_result']
+
+        # KPIs a nivel DISPO
+        dispo_min = df_r.groupby('DISPO')['PCT_LINEA'].min()
+        total     = dispo_min.count()
+        completas = (dispo_min >= 1).sum()
+        parciales = ((dispo_min > 0) & (dispo_min < 1)).sum()
+        sin_inv   = (dispo_min == 0).sum()
         cob       = df_r['LBS_ASIGNADO'].sum() / df_r['LBS_C'].sum()
 
-        st.markdown('<p class="section-title">Resumen de asignación</p>', unsafe_allow_html=True)
+        st.markdown('<p class="section-title">Resumen de asignación — por DISPO</p>',
+                    unsafe_allow_html=True)
         st.markdown(f"""
         <div class="kpi-grid">
             <div class="kpi-card green">
                 <div class="kpi-label">✅ Completas</div>
                 <div class="kpi-value">{completas:,}</div>
-                <div class="kpi-sub">{completas/total:.1%} del total</div>
+                <div class="kpi-sub">{completas/total:.1%} de {total:,} dispos</div>
             </div>
             <div class="kpi-card yellow">
                 <div class="kpi-label">⚠️ Parciales</div>
                 <div class="kpi-value">{parciales:,}</div>
-                <div class="kpi-sub">{parciales/total:.1%} del total</div>
+                <div class="kpi-sub">{parciales/total:.1%} de {total:,} dispos</div>
             </div>
             <div class="kpi-card red">
                 <div class="kpi-label">❌ Sin inventario</div>
                 <div class="kpi-value">{sin_inv:,}</div>
-                <div class="kpi-sub">{sin_inv/total:.1%} del total</div>
+                <div class="kpi-sub">{sin_inv/total:.1%} de {total:,} dispos</div>
             </div>
             <div class="kpi-card blue">
-                <div class="kpi-label">📦 Cobertura global</div>
+                <div class="kpi-label">📦 Cobertura LBS</div>
                 <div class="kpi-value">{cob:.1%}</div>
                 <div class="kpi-sub">Modo: {st.session_state['modo']}</div>
             </div>
@@ -385,46 +410,58 @@ with col_main:
 
         st.markdown('<p class="section-title">Detalle de resultados</p>', unsafe_allow_html=True)
 
-        # Filtros rápidos
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
             filtro_status = st.multiselect(
-                "Status", ['✅ COMPLETA', '⚠️ PARCIAL', '❌ SIN INVENTARIO'],
+                "Status DISPO",
+                ['✅ COMPLETA', '⚠️ PARCIAL', '❌ SIN INVENTARIO'],
                 default=['✅ COMPLETA', '⚠️ PARCIAL', '❌ SIN INVENTARIO'],
                 label_visibility="collapsed"
             )
         with fc2:
             opciones_entrega = sorted(df_r['ENTREGA'].dropna().unique())
-            filtro_entrega = st.multiselect("ENTREGA", opciones_entrega, default=opciones_entrega, label_visibility="collapsed")
+            filtro_entrega = st.multiselect("ENTREGA", opciones_entrega,
+                                            default=opciones_entrega,
+                                            label_visibility="collapsed")
         with fc3:
             if 'LOTSIZE' in df_r.columns:
                 opciones_lotsize = sorted(df_r['LOTSIZE'].dropna().unique())
-                filtro_lotsize = st.multiselect("LOTSIZE", opciones_lotsize, default=opciones_lotsize, label_visibility="collapsed")
+                filtro_lotsize = st.multiselect("LOTSIZE", opciones_lotsize,
+                                                default=opciones_lotsize,
+                                                label_visibility="collapsed")
             else:
                 filtro_lotsize = None
 
-        df_vis = df_r[df_r['STATUS_DISPO'].isin(filtro_status) & df_r['ENTREGA'].isin(filtro_entrega)]
+        df_vis = df_r[
+            df_r['STATUS_DISPO'].isin(filtro_status) &
+            df_r['ENTREGA'].isin(filtro_entrega)
+        ]
         if filtro_lotsize and 'LOTSIZE' in df_r.columns:
             df_vis = df_vis[df_vis['LOTSIZE'].isin(filtro_lotsize)]
 
-        cols_show = ['DISPO','ENTREGA','ESTILO_EQ','DTITULAR','LBS_C','INV',
-                     'LBS_ASIGNADO','LBS_FALTANTE','PCT_CUBIERTO','STATUS_DISPO']
+        cols_show = ['DISPO', 'ENTREGA', 'ESTILO_EQ', 'DTITULAR',
+                     'LBS_C', 'INV', 'LBS_ASIGNADO', 'LBS_FALTANTE',
+                     'PCT_LINEA', 'PCT_DISPO', 'STATUS_DISPO']
         if 'LOTSIZE' in df_r.columns:
             cols_show.insert(2, 'LOTSIZE')
         cols_show = [c for c in cols_show if c in df_r.columns]
 
         st.dataframe(
-            df_vis[cols_show].style.format({'PCT_CUBIERTO': '{:.1%}', 'LBS_C': '{:,.1f}',
-                                            'LBS_ASIGNADO': '{:,.1f}', 'LBS_FALTANTE': '{:,.1f}'}),
+            df_vis[cols_show].style.format({
+                'PCT_LINEA':  '{:.1%}',
+                'PCT_DISPO':  '{:.1%}',
+                'LBS_C':      '{:,.1f}',
+                'LBS_ASIGNADO': '{:,.1f}',
+                'LBS_FALTANTE': '{:,.1f}'
+            }),
             use_container_width=True, hide_index=True, height=420
         )
-        st.caption(f"Mostrando {len(df_vis):,} de {total:,} filas")
+        st.caption(f"Mostrando {len(df_vis):,} líneas · {df_vis['DISPO'].nunique():,} dispos")
 
         st.markdown('<p class="section-title">Descargar resultado</p>', unsafe_allow_html=True)
         ts = datetime.now().strftime('%Y%m%d%H%M')
         excel_bytes = generar_excel(df_r, entrega_pesos, lotsize_pesos, st.session_state['modo'])
 
-        st.markdown('<div class="download-btn">', unsafe_allow_html=True)
         st.download_button(
             label=f"⬇️  Descargar Excel — INVENTARIO_DISPOS_{ts}.xlsx",
             data=excel_bytes,
@@ -432,12 +469,12 @@ with col_main:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
-        st.markdown('</div>', unsafe_allow_html=True)
 
     else:
         st.markdown("""
         <div style="display:flex; align-items:center; justify-content:center; height:400px;
-                    border: 2px dashed #d1d5db; border-radius:12px; color:#9ca3af; flex-direction:column; gap:0.5rem;">
+                    border: 2px dashed #d1d5db; border-radius:12px; color:#9ca3af;
+                    flex-direction:column; gap:0.5rem;">
             <div style="font-size:2.5rem">📂</div>
             <div style="font-weight:600; font-size:1rem;">Sube tu archivo y presiona Procesar</div>
             <div style="font-size:0.82rem;">Los resultados aparecerán aquí</div>
