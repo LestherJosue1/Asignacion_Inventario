@@ -65,9 +65,8 @@ DEFAULT_ENTREGA = {
     '01-EXPEDITE': 1, '02-PAST DUE': 2, '03-DUE': 3, '04-AHEAD': 4, '05-AHEAD': 5,
 }
 DEFAULT_LOTSIZE = {
-    'D-2200': 1, 'C-2600': 2, 'F-1000': 3, 'B-3300': 4, 'A-4000': 5,
-    'H-0400': 6, 'G-0850': 7, 'E-1600': 8, 'I-0300': 9, 'MQM': 10, 'P-0700': 11,
-}
+    'C-2600': 1, 'D-2200': 2, 'B-3300': 3, 'A-4000': 4, 'F-1000': 5,
+    }
 CASCADA_COLOR_NOMBRES = {
     '0': 'BLANCO',   '1': 'AMARILLO', '2': 'NARANJA', '3': 'ROJO',
     '4': 'MORADO',   '5': 'ROYAL',    '6': 'VERDE',   '7': 'CAFÉ',
