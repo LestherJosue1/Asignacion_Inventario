@@ -277,7 +277,7 @@ def generar_reporte(df_result):
     # Cuadro 4: Resumen por ENTREGA - LOTSIZE - DISPO - ESTILO_EQ - DTITULAR - LBS_C
     group_cols = [c for c in ['ENTREGA', 'LOTSIZE', 'DISPO', 'ESTILO_EQ', 'DTITULAR']
                   if c in df_result.columns]
-    c4 = df_result[df_result['ACTIVO'] == 1].groupby(group_cols, dropna=False)['LBS_C'].sum().reset_index()
+    c4 = df_result[(df_result['ACTIVO'] == 1) & (df_result['STATUS_DISPO'] == '✅ COMPLETA')].groupby(group_cols, dropna=False)['LBS_C'].sum().reset_index()
     c4 = c4.sort_values(['ENTREGA', 'LBS_C'], ascending=[True, False])
 
     return c1, c2, c3, c4
