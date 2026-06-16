@@ -7,44 +7,111 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
 
-st.set_page_config(page_title="Completación de Dispos", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Inventory Allocation", page_icon="📦", layout="wide")
 
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    .block-container { padding: 2rem 3rem; max-width: 1400px; }
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+
+    html, body, [class*="css"], .stMarkdown, .stText, p, div {
+        font-family: 'DM Sans', sans-serif !important;
+        font-size: 12px !important;
+    }
+
+    /* ── Layout ── */
+    .block-container { padding: 1.2rem 2rem 2rem; max-width: 1440px; }
+    section[data-testid="stSidebar"] { background: #0f172a; }
+    section[data-testid="stSidebar"] * { color: #94a3b8 !important; font-size: 11px !important; }
+    section[data-testid="stSidebar"] .section-title { color: #475569 !important; border-color: #1e293b !important; }
+    section[data-testid="stSidebar"] input, section[data-testid="stSidebar"] select { background: #1e293b !important; color: #e2e8f0 !important; border-color: #334155 !important; font-size: 11px !important; }
+    section[data-testid="stSidebar"] strong { color: #cbd5e1 !important; }
+    section[data-testid="stSidebar"] .stSelectbox label { color: #64748b !important; }
+
+    /* ── Header ── */
     .app-header {
-        background: linear-gradient(135deg, #1a2f4e 0%, #0d4f3c 100%);
-        border-radius: 12px; padding: 2rem 2.5rem; margin-bottom: 2rem; color: white;
+        background: #0f172a;
+        border-bottom: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 1.1rem 1.6rem;
+        margin-bottom: 1.2rem;
+        display: flex; align-items: center; gap: 1.2rem;
     }
-    .app-header h1 { margin: 0; font-size: 1.8rem; font-weight: 700; letter-spacing: -0.5px; }
-    .app-header p  { margin: 0.4rem 0 0; font-size: 0.9rem; opacity: 0.75; }
+    .app-header-icon {
+        width: 36px; height: 36px; background: #1d4ed8;
+        border-radius: 8px; display: flex; align-items: center;
+        justify-content: center; font-size: 1rem; flex-shrink: 0;
+    }
+    .app-header h1 { margin: 0; font-size: 0.95rem; font-weight: 600; color: #f1f5f9; letter-spacing: -0.01em; }
+    .app-header p  { margin: 0.15rem 0 0; font-size: 0.68rem; color: #64748b; letter-spacing: 0.02em; }
+
+    /* ── Section labels ── */
     .section-title {
-        font-size: 0.75rem; font-weight: 700; letter-spacing: 0.12em;
-        text-transform: uppercase; color: #6b7280;
-        margin: 1.5rem 0 0.75rem; padding-bottom: 0.4rem; border-bottom: 1px solid #e5e7eb;
+        font-family: 'DM Mono', monospace !important;
+        font-size: 0.6rem !important; font-weight: 500;
+        letter-spacing: 0.14em; text-transform: uppercase;
+        color: #94a3b8; margin: 1.2rem 0 0.5rem;
+        padding-bottom: 0.3rem; border-bottom: 1px solid #e2e8f0;
     }
-    .kpi-grid { display: flex; gap: 1rem; margin: 1.2rem 0; flex-wrap: wrap; }
-    .kpi-card { flex: 1; min-width: 120px; border-radius: 10px; padding: 1.1rem 1.3rem; border: 1px solid #e5e7eb; }
-    .kpi-card.green  { background: #f0fdf4; border-color: #bbf7d0; }
-    .kpi-card.yellow { background: #fefce8; border-color: #fde68a; }
-    .kpi-card.red    { background: #fff1f2; border-color: #fecdd3; }
-    .kpi-card.blue   { background: #eff6ff; border-color: #bfdbfe; }
-    .kpi-card.gray   { background: #f9fafb; border-color: #e5e7eb; }
-    .kpi-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7280; margin-bottom: 0.3rem; }
-    .kpi-value { font-size: 1.9rem; font-weight: 700; line-height: 1; color: #111827; }
-    .kpi-sub   { font-size: 0.78rem; color: #6b7280; margin-top: 0.25rem; }
-    .scenario-tabs .stTabs [data-baseweb="tab"] { font-weight: 600; }
-    .tip-box { background: #f8fafc; border-left: 3px solid #3b82f6; border-radius: 0 8px 8px 0; padding: 0.75rem 1rem; font-size: 0.82rem; color: #374151; margin: 0.75rem 0; }
-    .warn-box { background: #fffbeb; border-left: 3px solid #f59e0b; border-radius: 0 8px 8px 0; padding: 0.75rem 1rem; font-size: 0.82rem; color: #374151; margin: 0.75rem 0; }
+
+    /* ── Scenario cards ── */
+    .sc-card {
+        border-radius: 6px; padding: 0.85rem 1rem;
+        border: 1px solid #e2e8f0; background: #fff;
+    }
+    .sc-card-blue   { border-left: 3px solid #1d4ed8; background: #f8faff; }
+    .sc-card-green  { border-left: 3px solid #059669; background: #f6fefa; }
+    .sc-card-purple { border-left: 3px solid #7c3aed; background: #faf7ff; }
+    .sc-label { font-family: 'DM Mono', monospace; font-size: 0.6rem; font-weight: 500;
+                letter-spacing: 0.1em; text-transform: uppercase; color: #94a3b8; margin-bottom: 0.6rem; }
+    .sc-row { display: flex; justify-content: space-between; align-items: center;
+              padding: 0.2rem 0; border-bottom: 1px solid #f1f5f9; }
+    .sc-row:last-child { border-bottom: none; padding-top: 0.35rem; margin-top: 0.2rem; }
+    .sc-metric { font-size: 0.7rem; color: #64748b; }
+    .sc-value  { font-size: 0.75rem; font-weight: 600; color: #0f172a; font-family: 'DM Mono', monospace; }
+    .sc-divider { border-top: 1px solid #e2e8f0; margin-top: 0.4rem; padding-top: 0.4rem; }
+
+    /* ── Inputs & buttons ── */
+    div[data-testid="stNumberInput"] label,
+    div[data-testid="stSelectbox"] label { font-size: 0.68rem !important; color: #64748b; }
+    .stButton > button {
+        font-size: 0.72rem !important; font-weight: 600; border-radius: 5px;
+        padding: 0.4rem 1rem; border: none; letter-spacing: 0.02em;
+    }
+    .stButton > button[kind="primary"] { background: #1d4ed8; color: white; }
+    .stButton > button[kind="primary"]:hover { background: #1e40af; }
+
+    /* ── Info boxes ── */
+    .tip-box  { background: #f8fafc; border-left: 2px solid #3b82f6; border-radius: 0 4px 4px 0;
+                padding: 0.5rem 0.75rem; font-size: 0.68rem; color: #475569; margin: 0.5rem 0; }
+    .warn-box { background: #fffbeb; border-left: 2px solid #f59e0b; border-radius: 0 4px 4px 0;
+                padding: 0.5rem 0.75rem; font-size: 0.68rem; color: #78350f; margin: 0.5rem 0; }
+
+    /* ── Dataframe text ── */
+    .stDataFrame, .stDataFrame td, .stDataFrame th { font-size: 11px !important; }
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab"] { font-size: 0.7rem !important; font-weight: 500; padding: 0.4rem 0.8rem; }
+    .stTabs [aria-selected="true"] { font-weight: 600 !important; }
+
+    /* ── Caption ── */
+    .stCaption, [data-testid="stCaptionContainer"] { font-size: 0.65rem !important; color: #94a3b8; }
+
+    /* ── Upload area ── */
+    [data-testid="stFileUploader"] { font-size: 0.7rem !important; }
+    [data-testid="stFileUploader"] label { font-size: 0.7rem !important; }
+
+    /* ── Success/warning alerts ── */
+    .stAlert { font-size: 0.7rem !important; padding: 0.4rem 0.75rem !important; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="app-header">
-    <h1>📦 Completación de Dispos — 3 Escenarios</h1>
-    <p>INV · INV+PLAN_DIA1 · INV+PLAN_SEMANAL · Llave: ESTILO_EQ + DTITULAR · Solo líneas ACTIVAS reciben inventario</p>
+    <div class="app-header-icon">📦</div>
+    <div>
+        <h1>Inventory Allocation — 3 Scenarios</h1>
+        <p>INV &nbsp;·&nbsp; INV + PLAN DIA1 &nbsp;·&nbsp; INV + PLAN SEMANAL &nbsp;·&nbsp; Key: ESTILO_EQ + DTITULAR</p>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -654,33 +721,18 @@ with col_main:
         # ── KPIs comparativos ─────────────────────────────────────────────────
         st.markdown('<p class="section-title">Comparativo de escenarios</p>', unsafe_allow_html=True)
         kpi_cols = st.columns(3)
-        sc_colors_bg = ['#eff6ff', '#f0fdf4', '#faf5ff']
-        sc_colors_bd = ['#bfdbfe', '#bbf7d0', '#e9d5ff']
+        sc_cls = ['sc-card-blue', 'sc-card-green', 'sc-card-purple']
         for i, r in enumerate(resultados):
             k = kpis(r['df'])
             with kpi_cols[i]:
                 st.markdown(f"""
-                <div style="background:{sc_colors_bg[i]};border:1px solid {sc_colors_bd[i]};
-                            border-radius:10px;padding:1rem 1.2rem;margin-bottom:0.5rem;">
-                  <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;
-                              letter-spacing:0.1em;color:#6b7280;margin-bottom:0.5rem;">{r['label']}</div>
-                  <div style="display:flex;justify-content:space-between;margin-bottom:0.3rem;">
-                    <span style="font-size:0.8rem;">✅ Completas</span>
-                    <strong>{k['completas']:,}</strong>
-                  </div>
-                  <div style="display:flex;justify-content:space-between;margin-bottom:0.3rem;">
-                    <span style="font-size:0.8rem;">⚠️ Parciales</span>
-                    <strong>{k['parciales']:,}</strong>
-                  </div>
-                  <div style="display:flex;justify-content:space-between;margin-bottom:0.3rem;">
-                    <span style="font-size:0.8rem;">❌ Sin inv</span>
-                    <strong>{k['sin_inv']:,}</strong>
-                  </div>
-                  <div style="display:flex;justify-content:space-between;border-top:1px solid {sc_colors_bd[i]};
-                              padding-top:0.4rem;margin-top:0.4rem;">
-                    <span style="font-size:0.8rem;">📦 Cobertura</span>
-                    <strong>{k['cob']:.1%}</strong>
-                  </div>
+                <div class="sc-card {sc_cls[i]}">
+                  <div class="sc-label">{r['label']}</div>
+                  <div class="sc-row"><span class="sc-metric">✅ Completas</span><span class="sc-value">{k['completas']:,}</span></div>
+                  <div class="sc-row"><span class="sc-metric">⚠️ Parciales</span><span class="sc-value">{k['parciales']:,}</span></div>
+                  <div class="sc-row"><span class="sc-metric">❌ Sin inventario</span><span class="sc-value">{k['sin_inv']:,}</span></div>
+                  <div class="sc-row sc-divider"><span class="sc-metric">⛔ Inactivas</span><span class="sc-value">{k['inactivas']:,}</span></div>
+                  <div class="sc-row"><span class="sc-metric">Coverage</span><span class="sc-value">{k['cob']:.1%}</span></div>
                 </div>
                 """, unsafe_allow_html=True)
 
