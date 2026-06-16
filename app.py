@@ -64,9 +64,22 @@ st.markdown("""
 DEFAULT_ENTREGA = {
     '01-EXPEDITE': 1, '02-PAST DUE': 2, '03-DUE': 3, '04-AHEAD': 4, '05-AHEAD': 5,
 }
+# LOTSIZE: prioridad de asignación
 DEFAULT_LOTSIZE = {
     'C-2600': 1, 'D-2200': 2, 'B-3300': 3, 'A-4000': 4, 'F-1000': 5,
 }
+
+# Capacidad por LOTSIZE+MIX: cuántas DISPOs (lotes) puede procesar cada combinación
+# Si se cubren todos los LOTSIZE activos y sobra inventario, se hace una segunda pasada sin límite
+CAPACIDAD_LOTSIZE = [
+    {'LOTSIZE': 'D-2200', 'MIX': 'BLEACH', 'LOTES': 14, 'PRIORIDAD': 1, 'ACTIVO': True},
+    {'LOTSIZE': 'F-1000', 'MIX': 'BLEACH', 'LOTES':  7, 'PRIORIDAD': 2, 'ACTIVO': True},
+    {'LOTSIZE': 'A-4000', 'MIX': 'DYE',    'LOTES':  4, 'PRIORIDAD': 1, 'ACTIVO': True},
+    {'LOTSIZE': 'B-3300', 'MIX': 'DYE',    'LOTES':  8, 'PRIORIDAD': 2, 'ACTIVO': True},
+    {'LOTSIZE': 'C-2600', 'MIX': 'DYE',    'LOTES': 38, 'PRIORIDAD': 3, 'ACTIVO': True},
+    {'LOTSIZE': 'D-2200', 'MIX': 'DYE',    'LOTES': 29, 'PRIORIDAD': 4, 'ACTIVO': True},
+    {'LOTSIZE': 'F-1000', 'MIX': 'DYE',    'LOTES': 33, 'PRIORIDAD': 5, 'ACTIVO': True},
+]
 CASCADA_COLOR_NOMBRES = {
     '0': 'BLANCO',   '1': 'AMARILLO', '2': 'NARANJA', '3': 'ROJO',
     '4': 'MORADO',   '5': 'ROYAL',    '6': 'VERDE',   '7': 'CAFÉ',
@@ -108,6 +121,36 @@ with st.sidebar:
         lotsize_pesos[val] = st.number_input(val, min_value=1, max_value=99,
                                              value=default, key=f"l_{val}")
 
+    # ── Capacidad LOTSIZE+MIX ─────────────────────────────────────────────────
+    st.markdown('<p class="section-title">Capacidad LOTSIZE + MIX</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="tip-box">Define cuántas DISPOs (lotes) puede procesar cada combinación. '
+        '🔴 INACTIVO = ese LOTSIZE+MIX no recibe asignación.</div>',
+        unsafe_allow_html=True
+    )
+    capacidad_cfg = []
+    for i, row in enumerate(CAPACIDAD_LOTSIZE):
+        col_a, col_b, col_c = st.columns([2, 1, 1])
+        with col_a:
+            st.markdown(f"**{row['LOTSIZE']} · {row['MIX']}** (P{row['PRIORIDAD']})")
+        with col_b:
+            lotes = st.number_input('Lotes', min_value=0, max_value=9999,
+                                    value=row['LOTES'], key=f"lotes_{i}",
+                                    label_visibility='collapsed')
+        with col_c:
+            activo_ls = st.selectbox('Estado', options=[True, False],
+                                     index=0 if row['ACTIVO'] else 1,
+                                     format_func=lambda x: '🟢' if x else '🔴',
+                                     key=f"activo_ls_{i}",
+                                     label_visibility='collapsed')
+        capacidad_cfg.append({
+            'LOTSIZE':    row['LOTSIZE'],
+            'MIX':        row['MIX'],
+            'LOTES':      lotes,
+            'PRIORIDAD':  row['PRIORIDAD'],
+            'ACTIVO':     activo_ls,
+        })
+
     # ── Cascada de color ──────────────────────────────────────────────────────
     st.markdown('<p class="section-title">Cascada de color (COLOR_A dígito 3)</p>',
                 unsafe_allow_html=True)
@@ -147,7 +190,7 @@ def extraer_digito3(color_a):
         return None
 
 
-def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_ins=False):
+def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_ins=False, capacidad_cfg=None):
     df = df.copy()
     df.columns = df.columns.str.strip().str.upper()
     df = df.dropna(subset=['ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV']).reset_index(drop=True)
@@ -182,29 +225,114 @@ def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_i
 
     df['_IDX'] = range(len(df))
 
-    # ACTIVAS primero dentro del grupo, luego por orden de prioridad
+    # ── Tabla de capacidad LOTSIZE+MIX ───────────────────────────────────────
+    # Construir dict: (LOTSIZE, MIX) -> {lotes_restantes, activo}
+    cap_cfg = capacidad_cfg or CAPACIDAD_LOTSIZE
+    cap_dict = {}
+    for row in cap_cfg:
+        key = (row['LOTSIZE'], row['MIX'])
+        cap_dict[key] = {'lotes': row['LOTES'], 'activo': row['ACTIVO']}
+
+    # Marcar si el LOTSIZE+MIX de la fila está activo en capacidad
+    def lotsize_mix_activo(row):
+        if 'LOTSIZE' not in row.index or 'MIX' not in row.index:
+            return True
+        key = (row.get('LOTSIZE'), row.get('MIX'))
+        cfg = cap_dict.get(key)
+        if cfg is None:
+            return True   # combinación no configurada → se permite
+        return cfg['activo']
+
+    df['_LS_ACTIVO'] = df.apply(lotsize_mix_activo, axis=1)
+
+    # ACTIVAS de color primero, luego por orden de prioridad
     df_sorted = df.sort_values(
         ['ESTILO_EQ', 'DTITULAR', 'ACTIVO', '_ORDEN', '_IDX'],
         ascending=[True, True, False, True, True]
     )
 
-    # ── Asignación acumulativa ────────────────────────────────────────────────
-    lbs_asignado, inv_restante_col = [], []
+    # ── Asignación en DOS PASADAS ─────────────────────────────────────────────
+    # Pasada 1: respeta límite de lotes por LOTSIZE+MIX
+    # Pasada 2: si todos los LOTSIZE activos llegaron a su límite, asigna el resto sin límite
 
-    for _, grupo in df_sorted.groupby(['ESTILO_EQ', 'DTITULAR'], sort=False):
+    # Contadores de lotes usados por (LOTSIZE, MIX) — se resetean para cada grupo ESTILO+DTITULAR
+    # pero la capacidad es GLOBAL (misma tabla aplica a todo el dataset)
+    lotes_usados = {k: 0 for k in cap_dict}
+
+    # Primera pasada: asignar respetando capacidad
+    lbs_asignado     = [0.0] * len(df_sorted)
+    inv_restante_col = [0.0] * len(df_sorted)
+    dispos_asignadas_p1 = set()  # DISPOs completadas en pasada 1
+
+    idx_map = {idx: pos for pos, idx in enumerate(df_sorted.index)}
+
+    for (esq, dtit), grupo in df_sorted.groupby(['ESTILO_EQ', 'DTITULAR'], sort=False):
         inv_disp  = grupo['INV_EFECTIVO'].iloc[0]
         acumulado = 0
-        for _, fila in grupo.iterrows():
+        for orig_idx, fila in grupo.iterrows():
+            pos    = idx_map[orig_idx]
             lbs_c  = fila['LBS_C']
-            activo = fila['ACTIVO']
-            if activo == 1:
+            activo_color = fila['ACTIVO']
+            activo_ls    = fila['_LS_ACTIVO']
+
+            if activo_color == 0 or not activo_ls:
+                # Inactivo por color o por LOTSIZE — no recibe, no consume
+                lbs_asignado[pos]     = 0
+                inv_restante_col[pos] = max(0, inv_disp - acumulado)
+                continue
+
+            # Verificar capacidad de lotes para este LOTSIZE+MIX
+            key = (fila.get('LOTSIZE'), fila.get('MIX')) if 'LOTSIZE' in fila.index and 'MIX' in fila.index else None
+            cfg = cap_dict.get(key) if key else None
+
+            if cfg is not None:
+                if lotes_usados.get(key, 0) >= cfg['lotes']:
+                    # Sin capacidad en pasada 1 — marca para pasada 2
+                    lbs_asignado[pos]     = -1   # sentinel
+                    inv_restante_col[pos] = max(0, inv_disp - acumulado)
+                    continue
+
+            # Asignar
+            disponible = max(0, inv_disp - acumulado)
+            asignado   = min(lbs_c, disponible)
+            acumulado += lbs_c
+            lbs_asignado[pos]     = asignado
+            inv_restante_col[pos] = max(0, inv_disp - acumulado)
+
+            if key and key in lotes_usados:
+                lotes_usados[key] = lotes_usados.get(key, 0) + 1
+
+    # Segunda pasada: filas con sentinel -1 (capacidad excedida en pasada 1)
+    # Solo si todos los LOTSIZE activos ya llegaron a su límite
+    todos_cubiertos = all(
+        lotes_usados.get(k, 0) >= v['lotes']
+        for k, v in cap_dict.items()
+        if v['activo']
+    )
+
+    if todos_cubiertos:
+        for (esq, dtit), grupo in df_sorted.groupby(['ESTILO_EQ', 'DTITULAR'], sort=False):
+            # Recalcular acumulado real de pasada 1 para este grupo
+            acumulado = sum(
+                lbs_asignado[idx_map[i]] for i in grupo.index
+                if lbs_asignado[idx_map[i]] > 0
+            )
+            inv_disp = grupo['INV_EFECTIVO'].iloc[0]
+            for orig_idx, fila in grupo.iterrows():
+                pos = idx_map[orig_idx]
+                if lbs_asignado[pos] != -1:
+                    continue  # ya asignado o inactivo
+                lbs_c      = fila['LBS_C']
                 disponible = max(0, inv_disp - acumulado)
                 asignado   = min(lbs_c, disponible)
                 acumulado += lbs_c
-            else:
-                asignado = 0  # no recibe y no consume inventario
-            lbs_asignado.append(asignado)
-            inv_restante_col.append(max(0, inv_disp - acumulado))
+                lbs_asignado[pos]     = asignado
+                inv_restante_col[pos] = max(0, inv_disp - acumulado)
+    else:
+        # No se cubrieron todos — filas sentinel quedan en 0
+        for i, v in enumerate(lbs_asignado):
+            if v == -1:
+                lbs_asignado[i] = 0
 
     df_sorted['LBS_ASIGNADO'] = lbs_asignado
     df_sorted['INV_RESTANTE'] = inv_restante_col
@@ -565,7 +693,8 @@ with col_upload:
                     with st.spinner("Calculando asignación..."):
                         st.session_state['df_result'] = procesar(
                             df_raw, entrega_pesos, lotsize_pesos,
-                            modo, cascada_activo, usar_plan_ins
+                            modo, cascada_activo, usar_plan_ins,
+                            capacidad_cfg
                         )
                         st.session_state['modo']         = modo
                         st.session_state['usar_plan_ins'] = usar_plan_ins
