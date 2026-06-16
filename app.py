@@ -439,7 +439,7 @@ def write_table(ws, title, df, start_row, start_col, header_color, st_):
     return start_row + len(df) + 3
 
 
-def generar_reporte_comparativo(ws, resultados, st_):
+def generar_reporte_comparativo(ws, resultados, capacidad_cfg_rep, st_):
     """
     Escribe 4 cuadros, cada uno con 3 columnas de LBS_C (una por escenario).
     resultados = [{'label': ..., 'df': ...}, ...]
@@ -542,17 +542,143 @@ def generar_reporte_comparativo(ws, resultados, st_):
         for col in ['E','F','G','H','I','J','K','L','M']:
             ws.column_dimensions[col].width = 16
 
+    # ── Cuadro 5 — Cumplimiento LOTSIZE+MIX vs Meta ─────────────────────────
+    def cuadro5(ws, start_row, start_col):
+        FW, FN, FB, FT, brd = st_['FW'], st_['FN'], st_['FB'], st_['FT'], st_['brd']
+        sc_colors = [COLOR_H['sc1'], COLOR_H['sc2'], COLOR_H['sc3']]
+
+        # Construir tabla base desde tabla de capacidad
+        cap_df = pd.DataFrame(capacidad_cfg_rep)[['LOTSIZE','MIX','LOTES','ACTIVO']]
+        cap_df = cap_df[cap_df['ACTIVO']].copy()
+        cap_df = cap_df.rename(columns={'LOTES': 'META_DISPOS'})
+        cap_df = cap_df.sort_values(['LOTSIZE','MIX']).reset_index(drop=True)
+
+        # Para cada escenario, contar DISPOs únicas completas por LOTSIZE+MIX
+        for r in resultados:
+            completas = r['df'][
+                (r['df']['STATUS_DISPO'] == '✅ COMPLETA') &
+                (r['df']['ACTIVO'] == 1)
+            ]
+            if 'LOTSIZE' in completas.columns and 'MIX' in completas.columns:
+                cnt = (completas.groupby(['LOTSIZE','MIX'])['DISPO']
+                       .nunique()
+                       .reset_index()
+                       .rename(columns={'DISPO': f'ASIG_{r["key"]}'}))
+                cap_df = cap_df.merge(cnt, on=['LOTSIZE','MIX'], how='left')
+                cap_df[f'ASIG_{r["key"]}'] = cap_df[f'ASIG_{r["key"]}'].fillna(0).astype(int)
+                cap_df[f'CMP_{r["key"]}']  = cap_df[f'ASIG_{r["key"]}'] / cap_df['META_DISPOS'].replace(0, np.nan)
+            else:
+                cap_df[f'ASIG_{r["key"]}'] = 0
+                cap_df[f'CMP_{r["key"]}']  = 0.0
+
+        title   = '📋 Cuadro 5 — Cumplimiento de Dispos por LOTSIZE + MIX vs Meta'
+        # Build display columns: LOTSIZE | MIX | META | [ASIG_sc | CMP_sc] x3
+        disp_cols = ['LOTSIZE', 'MIX', 'META_DISPOS']
+        for r in resultados:
+            disp_cols += [f'ASIG_{r["key"]}', f'CMP_{r["key"]}']
+
+        n_cols  = len(disp_cols)
+        end_col = start_col + n_cols - 1
+
+        # Title row
+        tc = ws.cell(row=start_row, column=start_col, value=title)
+        tc.font = FW; tc.fill = PatternFill('solid', start_color='1E3A5F')
+        tc.alignment = Alignment(horizontal='center'); tc.border = brd
+        ws.merge_cells(start_row=start_row, start_column=start_col,
+                       end_row=start_row, end_column=end_col)
+
+        # Header row
+        header_labels = {
+            'LOTSIZE': 'LOTSIZE', 'MIX': 'MIX', 'META_DISPOS': 'META DISPOS',
+        }
+        for r in resultados:
+            header_labels[f'ASIG_{r["key"]}'] = f'ASIG {r["key"]}'
+            header_labels[f'CMP_{r["key"]}']  = f'CMP% {r["key"]}'
+
+        sc_map = {}
+        for r in resultados:
+            sc_map[f'ASIG_{r["key"]}'] = sc_colors[resultados.index(r)]
+            sc_map[f'CMP_{r["key"]}']  = sc_colors[resultados.index(r)]
+
+        for ci, col_name in enumerate(disp_cols, start=start_col):
+            c = ws.cell(row=start_row+1, column=ci, value=header_labels.get(col_name, col_name))
+            c.alignment = Alignment(horizontal='center', wrap_text=True)
+            c.border = brd
+            if col_name in sc_map:
+                c.font = Font(color='FFFFFF', bold=True, name='Arial', size=9)
+                c.fill = PatternFill('solid', start_color=sc_map[col_name])
+            else:
+                c.font = FB
+                c.fill = PatternFill('solid', start_color='D9D9D9')
+        ws.row_dimensions[start_row+1].height = 28
+
+        # Data rows
+        f_green  = PatternFill('solid', start_color='C6EFCE')
+        f_yellow = PatternFill('solid', start_color='FFEB9C')
+        f_red    = PatternFill('solid', start_color='FFC7CE')
+
+        for ri, (_, row_data) in enumerate(cap_df[disp_cols].iterrows(), start=start_row+2):
+            for ci, col_name in enumerate(disp_cols, start=start_col):
+                val  = row_data[col_name]
+                cell = ws.cell(row=ri, column=ci, value=val)
+                cell.border = brd; cell.font = FN
+
+                if col_name.startswith('CMP_') and isinstance(val, float):
+                    cell.number_format = '0.0%'
+                    cell.alignment = Alignment(horizontal='center')
+                    cell.fill = (f_green if val >= 1.0 else f_yellow if val >= 0.5 else f_red)
+                elif col_name.startswith('ASIG_') or col_name == 'META_DISPOS':
+                    cell.alignment = Alignment(horizontal='center')
+                    cell.number_format = '0'
+                else:
+                    cell.alignment = Alignment(horizontal='left')
+
+        # Total row
+        total_ri = start_row + 2 + len(cap_df)
+        ws.cell(row=total_ri, column=start_col, value='TOTAL').font = FT
+        ws.cell(row=total_ri, column=start_col).border = brd
+        ws.cell(row=total_ri, column=start_col+1, value='').border = brd
+        meta_total = cap_df['META_DISPOS'].sum()
+        ws.cell(row=total_ri, column=start_col+2, value=meta_total).font = FT
+        ws.cell(row=total_ri, column=start_col+2).border = brd
+        ws.cell(row=total_ri, column=start_col+2).alignment = Alignment(horizontal='center')
+        ws.cell(row=total_ri, column=start_col+2).fill = PatternFill('solid', start_color=COLOR_ROW['total'])
+
+        for j, r in enumerate(resultados):
+            asig_col = start_col + 3 + j * 2
+            cmp_col  = asig_col + 1
+            asig_total = cap_df[f'ASIG_{r["key"]}'].sum()
+            cmp_total  = asig_total / meta_total if meta_total > 0 else 0
+
+            for col_i, val, fmt in [(asig_col, asig_total, '0'), (cmp_col, cmp_total, '0.0%')]:
+                c = ws.cell(row=total_ri, column=col_i, value=val)
+                c.font = FT; c.border = brd; c.number_format = fmt
+                c.alignment = Alignment(horizontal='center')
+                c.fill = PatternFill('solid', start_color=COLOR_ROW['total'])
+
+        # Column widths
+        for ci, col_name in enumerate(disp_cols, start=start_col):
+            col_letter = get_column_letter(ci)
+            ws.column_dimensions[col_letter].width = (
+                14 if col_name in ('LOTSIZE','MIX') else
+                10 if col_name == 'META_DISPOS' else
+                10
+            )
+
+        return start_row + len(cap_df) + 5
+
     # ── Posiciones ────────────────────────────────────────────────────────────
     next_row = cuadro_comparativo(ws, '📋 Cuadro 1 — Completas por ENTREGA',
                                    'LBS_C', 'ENTREGA', 1, 1, COLOR_H['orig'])
     next_row = cuadro_comparativo(ws, '📋 Cuadro 2 — Completas por LOTSIZE',
                                    'LBS_C', 'LOTSIZE', next_row, 1, COLOR_H['orig'])
-    cuadro_comparativo(ws, '📋 Cuadro 3 — Completas por COLOR',
-                       'LBS_C', 'COLOR_NOMBRE', next_row, 1, COLOR_H['orig'])
-    cuadro4(ws, 1, 6)
+    next_row = cuadro_comparativo(ws, '📋 Cuadro 3 — Completas por COLOR',
+                                  'LBS_C', 'COLOR_NOMBRE', next_row, 1, COLOR_H['orig'])
+    cuadro5(ws, next_row, 1)
+    cuadro4(ws, 1, 12)
 
-    for col in ['A', 'B', 'C', 'D', 'E']:
-        ws.column_dimensions[col].width = 18
+    for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K']:
+        ws.column_dimensions[col].width = 14
 
 
 def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg):
@@ -656,7 +782,7 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg):
 
     # ── REPORTE comparativo ───────────────────────────────────────────────────
     ws_rep = wb['REPORTE']
-    generar_reporte_comparativo(ws_rep, resultados, st_)
+    generar_reporte_comparativo(ws_rep, resultados, capacidad_cfg or CAPACIDAD_LOTSIZE, st_)
 
     out = io.BytesIO()
     wb.save(out); out.seek(0)
