@@ -64,11 +64,6 @@ st.markdown("""
 DEFAULT_ENTREGA = {
     '01-EXPEDITE': 1, '02-PAST DUE': 2, '03-DUE': 3, '04-AHEAD': 4, '05-AHEAD': 5,
 }
-# LOTSIZE: prioridad de asignación
-DEFAULT_LOTSIZE = {
-    'C-2600': 1, 'D-2200': 2, 'B-3300': 3, 'A-4000': 4, 'F-1000': 5,
-}
-
 # Capacidad por LOTSIZE+MIX: cuántas DISPOs (lotes) puede procesar cada combinación
 # Si se cubren todos los LOTSIZE activos y sobra inventario, se hace una segunda pasada sin límite
 CAPACIDAD_LOTSIZE = [
@@ -98,14 +93,6 @@ with st.sidebar:
         help="Suma el inventario planeado de entrada al inventario actual antes de asignar."
     )
 
-    # ── Modo prioridad ────────────────────────────────────────────────────────
-    st.markdown('<p class="section-title">Modo de prioridad</p>', unsafe_allow_html=True)
-    modo = st.selectbox(
-        "¿Cuál dimensión domina?",
-        options=['ENTREGA', 'LOTSIZE', 'IGUAL'],
-        help="ENTREGA: la entrega decide primero, LOTSIZE desempata. LOTSIZE: al revés. IGUAL: se suman."
-    )
-
     # ── ENTREGA ───────────────────────────────────────────────────────────────
     st.markdown('<p class="section-title">Prioridad ENTREGA</p>', unsafe_allow_html=True)
     st.markdown('<div class="tip-box">Menor número = mayor prioridad.</div>', unsafe_allow_html=True)
@@ -113,13 +100,6 @@ with st.sidebar:
     for val, default in DEFAULT_ENTREGA.items():
         entrega_pesos[val] = st.number_input(val, min_value=1, max_value=99,
                                              value=default, key=f"e_{val}")
-
-    # ── LOTSIZE ───────────────────────────────────────────────────────────────
-    st.markdown('<p class="section-title">Prioridad LOTSIZE</p>', unsafe_allow_html=True)
-    lotsize_pesos = {}
-    for val, default in DEFAULT_LOTSIZE.items():
-        lotsize_pesos[val] = st.number_input(val, min_value=1, max_value=99,
-                                             value=default, key=f"l_{val}")
 
     # ── Capacidad LOTSIZE+MIX ─────────────────────────────────────────────────
     st.markdown('<p class="section-title">Capacidad LOTSIZE + MIX</p>', unsafe_allow_html=True)
@@ -190,7 +170,7 @@ def extraer_digito3(color_a):
         return None
 
 
-def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_ins=False, capacidad_cfg=None):
+def procesar(df, entrega_pesos, cascada_activo, usar_plan_ins=False, capacidad_cfg=None):
     df = df.copy()
     df.columns = df.columns.str.strip().str.upper()
     df = df.dropna(subset=['ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV']).reset_index(drop=True)
@@ -212,16 +192,21 @@ def procesar(df, entrega_pesos, lotsize_pesos, modo, cascada_activo, usar_plan_i
         df['ACTIVO']       = 1
 
     # ── Pesos de prioridad ────────────────────────────────────────────────────
+    # ENTREGA: peso configurable desde sidebar
     df['_PESO_E'] = df['ENTREGA'].map(entrega_pesos).fillna(99).astype(int)
-    df['_PESO_L'] = df['LOTSIZE'].map(lotsize_pesos).fillna(99).astype(int) \
-                   if 'LOTSIZE' in df.columns else 99
 
-    if modo == 'ENTREGA':
-        df['_ORDEN'] = df['_PESO_E'] * 100 + df['_PESO_L']
-    elif modo == 'LOTSIZE':
-        df['_ORDEN'] = df['_PESO_L'] * 100 + df['_PESO_E']
+    # LOTSIZE+MIX: prioridad viene de la tabla de capacidad
+    cap_cfg_temp = capacidad_cfg or CAPACIDAD_LOTSIZE
+    ls_mix_prio = {(r['LOTSIZE'], r['MIX']): r['PRIORIDAD'] for r in cap_cfg_temp}
+    if 'LOTSIZE' in df.columns and 'MIX' in df.columns:
+        df['_PESO_L'] = df.apply(
+            lambda r: ls_mix_prio.get((r['LOTSIZE'], r['MIX']), 99), axis=1
+        ).astype(int)
     else:
-        df['_ORDEN'] = df['_PESO_E'] + df['_PESO_L']
+        df['_PESO_L'] = 99
+
+    # Orden: ENTREGA domina, LOTSIZE+MIX desempata
+    df['_ORDEN'] = df['_PESO_E'] * 100 + df['_PESO_L']
 
     df['_IDX'] = range(len(df))
 
@@ -480,7 +465,7 @@ def escribir_reporte_excel(ws, c1, c2, c3, c4, FW, FN, FB, brd,
     for col in ['E', 'F', 'G', 'H', 'I', 'J']:
         ws.column_dimensions[col].width = 16
 
-def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo, usar_plan_ins):
+def generar_excel(df_result, entrega_pesos, cascada_activo, usar_plan_ins):
     COLOR_H_ORIG = '2F4F7F'
     COLOR_H_NEW  = '1D6A40'
     COLOR_H_CFG  = '7B3F00'
@@ -526,7 +511,7 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo,
                 '❌ DISPOs sin inventario', 'Líneas inactivas (excluidas)',
                 'LBS necesarias (activas)', 'LBS asignadas', 'LBS faltantes',
                 '% Cobertura global (LBS activas)',
-                'Inventario usado', 'Modo prioridad', 'Generado'
+                'Inventario usado', 'Generado'
             ],
             'Valor': [
                 total_d, completas, parciales, sin_inv, inac_lines,
@@ -535,16 +520,15 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo,
                 round(activas['LBS_FALTANTE'].sum(), 1),
                 f'{cob_global:.1%}',
                 'INV + PLAN_INS_DIA1' if usar_plan_ins else 'Solo INV',
-                modo,
                 datetime.now().strftime('%Y-%m-%d %H:%M')
             ]
         }).to_excel(writer, sheet_name='RESUMEN', index=False)
 
-        cfg_e = pd.DataFrame(list(entrega_pesos.items()), columns=['ENTREGA', 'PESO'])
-        cfg_l = pd.DataFrame(list(lotsize_pesos.items()), columns=['LOTSIZE', 'PESO'])
+        cfg_e  = pd.DataFrame(list(entrega_pesos.items()), columns=['ENTREGA', 'PESO'])
+        cfg_ls = pd.DataFrame(capacidad_cfg or CAPACIDAD_LOTSIZE)
         cfg_e.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=0)
-        cfg_l.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=3)
-        cfg_cascada.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=6)
+        cfg_ls.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=3)
+        cfg_cascada.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=9)
 
         # Hoja REPORTE — placeholder (se llena después con openpyxl)
         pd.DataFrame().to_excel(writer, sheet_name='REPORTE', index=False)
@@ -610,18 +594,18 @@ def generar_excel(df_result, entrega_pesos, lotsize_pesos, cascada_activo, modo,
 
     # ── Formatear CONFIG ──────────────────────────────────────────────────────
     ws_c = wb['CONFIG']
-    titulos = {1: 'PRIORIDAD ENTREGA', 4: 'PRIORIDAD LOTSIZE', 7: 'CASCADA DE COLOR'}
+    titulos = {1: 'PRIORIDAD ENTREGA', 4: 'CAPACIDAD LOTSIZE+MIX', 10: 'CASCADA DE COLOR'}
     for col_start, titulo in titulos.items():
         cell = ws_c.cell(row=1, column=col_start)
         cell.value     = titulo
         cell.fill      = PatternFill('solid', start_color=COLOR_H_CFG)
         cell.font      = FW
         cell.alignment = Alignment(horizontal='center')
-    for m in ['A1:B1', 'D1:E1', 'G1:I1']:
+    for m in ['A1:B1', 'D1:H1', 'J1:L1']:
         ws_c.merge_cells(m)
-    for col in ['A','B','D','E','G','H','I']:
+    for col in ['A','B','D','E','F','G','H','J','K','L']:
         ws_c.column_dimensions[col].width = 16
-    for col in ['C','F']:
+    for col in ['C','I']:
         ws_c.column_dimensions[col].width = 4
     for row in ws_c.iter_rows(min_row=2, max_row=ws_c.max_row):
         for cell in row:
@@ -692,11 +676,10 @@ with col_upload:
                 if st.button("▶ Procesar", type="primary", use_container_width=True):
                     with st.spinner("Calculando asignación..."):
                         st.session_state['df_result'] = procesar(
-                            df_raw, entrega_pesos, lotsize_pesos,
-                            modo, cascada_activo, usar_plan_ins,
+                            df_raw, entrega_pesos,
+                            cascada_activo, usar_plan_ins,
                             capacidad_cfg
                         )
-                        st.session_state['modo']         = modo
                         st.session_state['usar_plan_ins'] = usar_plan_ins
 
 with col_main:
@@ -735,7 +718,7 @@ with col_main:
             <div class="kpi-card blue">
                 <div class="kpi-label">📦 Cobertura LBS</div>
                 <div class="kpi-value">{cob:.1%}</div>
-                <div class="kpi-sub">{inv_label} · Modo: {st.session_state['modo']}</div>
+                <div class="kpi-sub">{inv_label}</div>
             </div>
             <div class="kpi-card gray">
                 <div class="kpi-label">⛔ Líneas inactivas</div>
@@ -814,8 +797,8 @@ with col_main:
         st.markdown('<p class="section-title">Descargar resultado</p>', unsafe_allow_html=True)
         ts = datetime.now().strftime('%Y%m%d%H%M')
         excel_bytes = generar_excel(
-            df_r, entrega_pesos, lotsize_pesos,
-            cascada_activo, modo,
+            df_r, entrega_pesos,
+            cascada_activo,
             st.session_state.get('usar_plan_ins', False)
         )
         st.download_button(
