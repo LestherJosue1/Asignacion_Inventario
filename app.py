@@ -7,6 +7,7 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import FormulaRule
 import io
+import json
 
 try:
     import plotly.express as px
@@ -80,6 +81,18 @@ st.markdown("""
     [data-testid="stFileUploader"] { font-size: 0.7rem !important; }
     [data-testid="stFileUploader"] label { font-size: 0.7rem !important; }
     .stAlert { font-size: 0.7rem !important; padding: 0.4rem 0.75rem !important; }
+
+    .step-header { display: flex; align-items: center; gap: 0.6rem; margin: 1.6rem 0 0.8rem; }
+    .step-badge { width: 28px; height: 28px; border-radius: 50%; background: #1d4ed8; color: white;
+        display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.85rem;
+        font-family: 'DM Mono', monospace; flex-shrink: 0; }
+    .step-title { font-size: 1.05rem !important; font-weight: 700; color: #0f172a; margin: 0; }
+    .step-sub { font-size: 0.72rem !important; color: #64748b; margin: 0.1rem 0 0 2.2rem; }
+
+    div[data-testid="stExpander"] { border: 1px solid #e2e8f0 !important; border-radius: 8px !important;
+        margin-bottom: 0.6rem; }
+    div[data-testid="stExpander"] summary { font-size: 0.78rem !important; font-weight: 600 !important; }
+    div[data-testid="stDataEditor"] { font-size: 11px !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -185,6 +198,25 @@ def validar_huerfanos(df_wip, df_cuota):
     return solo_wip, solo_cuota
 
 
+def validar_lotsize_no_configurados(df_wip, capacidad_cfg):
+    """Combinaciones LOTSIZE+MIX presentes en WIP pero ausentes de la config
+    — esas líneas quedan en 0 (capacidad inactiva), nunca infinita."""
+    cfg_keys = {(str(r['LOTSIZE']), str(r['MIX'])) for r in capacidad_cfg}
+    wip = df_wip.copy()
+    wip.columns = wip.columns.str.strip().str.upper()
+    if not {'LOTSIZE', 'MIX'}.issubset(wip.columns):
+        return pd.DataFrame()
+    wip['_KEY'] = list(zip(wip['LOTSIZE'].astype(str), wip['MIX'].astype(str)))
+    faltan = wip[~wip['_KEY'].isin(cfg_keys)]
+    if faltan.empty:
+        return pd.DataFrame()
+    resumen = faltan.groupby(['LOTSIZE', 'MIX']).agg(
+        N_LINEAS=('DISPO', 'count'),
+        LBS_C_TOTAL=('LBS_C', 'sum'),
+    ).reset_index().sort_values('LBS_C_TOTAL', ascending=False)
+    return resumen
+
+
 def extraer_digito3(color_a):
     try:
         s = str(int(float(color_a))) if str(color_a).replace('.', '').isdigit() else str(color_a)
@@ -241,11 +273,15 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
     ls_activo_arr = np.zeros(n_mach, dtype=bool)
     prioridad_arr = np.full(n_mach, 99.0)
     evitar_arr    = np.zeros(n_mach, dtype=bool)
+    combos_sin_config = set()
     for c in range(n_mach):
         cfg = cfg_by_key.get(mach_keys[c])
         if cfg is None:
-            cap_lbs_arr[c]   = float('inf')
-            ls_activo_arr[c] = True
+            # LOTSIZE+MIX que no está en la configuración → NO se asigna
+            # (capacidad 0 / inactiva), nunca capacidad infinita.
+            cap_lbs_arr[c]   = 0.0
+            ls_activo_arr[c] = False
+            combos_sin_config.add(mach_keys[c])
         else:
             lbs_por_lote     = float(cfg.get('LBS_POR_LOTE', 0)) or 0.0
             cap_lbs_arr[c]   = float(cfg['LOTES']) * 7.0 * lbs_por_lote
@@ -790,125 +826,215 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
     return out
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### ⚙️ Configuración")
+# ── Helpers de perfil de configuración ──────────────────────────────────────
+def default_cap_df():
+    return pd.DataFrame(CAPACIDAD_LOTSIZE)
 
-    st.markdown('<p class="section-title">Prioridad ENTREGA</p>', unsafe_allow_html=True)
-    st.markdown('<div class="tip-box">Menor número = mayor prioridad.</div>', unsafe_allow_html=True)
-    entrega_pesos = {}
-    for val, default in DEFAULT_ENTREGA.items():
-        entrega_pesos[val] = st.number_input(val, min_value=1, max_value=99, value=default, key=f"e_{val}")
 
-    st.markdown('<p class="section-title">Capacidad LOTSIZE + MIX (semanal)</p>', unsafe_allow_html=True)
-    st.markdown('<div class="tip-box">Capacidad semanal (lbs) = lotes/día × 7 × lbs/lote. 🔴 inactivo = no recibe asignación.</div>',
-                unsafe_allow_html=True)
-    capacidad_cfg = []
-    for i, row in enumerate(CAPACIDAD_LOTSIZE):
-        evitar_tag = " ⚠️EVITAR" if row['EVITAR'] else ""
-        col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 1])
-        with col_a:
-            st.markdown(f"**{row['LOTSIZE']} · {row['MIX']}**{evitar_tag} (P{row['PRIORIDAD']})")
-        with col_b:
-            lotes = st.number_input('Lotes/día', min_value=0, max_value=9999, value=row['LOTES'],
-                                     key=f"lotes_{i}", label_visibility='collapsed')
-        with col_c:
-            lbs_lote = st.number_input('Lbs/lote', min_value=0, max_value=99999, value=row['LBS_POR_LOTE'],
-                                        step=100, key=f"lbslote_{i}", label_visibility='collapsed')
-        with col_d:
-            activo_ls = st.selectbox('Estado', options=[True, False], index=0 if row['ACTIVO'] else 1,
-                                      format_func=lambda x: '🟢' if x else '🔴', key=f"activo_ls_{i}",
-                                      label_visibility='collapsed')
-        cap_sem = lotes * 7 * lbs_lote
-        st.caption(f"↳ {lotes} lotes/día × 7 × {lbs_lote:,} lbs/lote = **{cap_sem:,.0f} lbs/semana**")
-        capacidad_cfg.append({**row, 'LOTES': lotes, 'LBS_POR_LOTE': lbs_lote, 'ACTIVO': activo_ls})
+def default_entrega_df():
+    return pd.DataFrame(list(DEFAULT_ENTREGA.items()), columns=['ENTREGA', 'PESO'])
 
-    cap_total_sem = sum(r['LOTES'] * 7 * r['LBS_POR_LOTE'] for r in capacidad_cfg if r['ACTIVO'])
-    st.markdown(f'<div class="tip-box">📦 Capacidad total semanal activa: <strong>{cap_total_sem:,.0f} lbs</strong></div>',
-                unsafe_allow_html=True)
 
-    if any(r['EVITAR'] for r in CAPACIDAD_LOTSIZE):
-        st.markdown('<div class="evitar-box">⚠️ Las filas marcadas EVITAR solo se habilitan con prioridad normal si ENTREGA=01-EXPEDITE o la línea está en Fase ABASTO.</div>',
-                    unsafe_allow_html=True)
+def default_cascada_df():
+    return pd.DataFrame([{'DIGITO': d, 'COLOR': n, 'ACTIVO': True} for d, n in CASCADA_COLOR_NOMBRES.items()])
 
-    st.markdown('<p class="section-title">Cascada de color (COLOR_A dígito 3)</p>', unsafe_allow_html=True)
-    st.markdown('<div class="warn-box">🔴 INACTIVO = no recibe inventario.</div>', unsafe_allow_html=True)
-    cascada_activo = {}
-    for digito, nombre in CASCADA_COLOR_NOMBRES.items():
-        cascada_activo[digito] = st.selectbox(
-            f"{digito} — {nombre}", options=[1, 0], index=0,
-            format_func=lambda x: "🟢 ACTIVO" if x == 1 else "🔴 INACTIVO", key=f"color_{digito}"
-        )
 
-# ── Layout principal ──────────────────────────────────────────────────────────
-col_upload, col_main = st.columns([1, 2.5], gap="large")
+if 'cfg_version' not in st.session_state:
+    st.session_state['cfg_version']     = 0
+    st.session_state['cap_df_seed']     = default_cap_df()
+    st.session_state['entrega_df_seed'] = default_entrega_df()
+    st.session_state['cascada_df_seed'] = default_cascada_df()
 
-with col_upload:
-    st.markdown('<p class="section-title">Workbook TIM_WIPCR</p>', unsafe_allow_html=True)
-    st.caption("Hojas requeridas: WIP (data completa) y CUOTA (metas ABASTO/CUOTA)")
-    uploaded = st.file_uploader("Sube TIM_WIPCR.xlsx", type=['xlsx', 'xls'], label_visibility="collapsed")
+# ── 1. Cargar datos ──────────────────────────────────────────────────────────
+st.markdown("""
+<div class="step-header"><div class="step-badge">1</div><div><p class="step-title">Cargar datos</p></div></div>
+""", unsafe_allow_html=True)
+st.caption("Workbook TIM_WIPCR.xlsx — hojas requeridas: WIP (data completa) y CUOTA (metas ABASTO/CUOTA)")
+uploaded = st.file_uploader("Sube TIM_WIPCR.xlsx", type=['xlsx', 'xls'], label_visibility="collapsed")
 
-    if uploaded:
-        df_wip, df_cuota, err = leer_tim_wipcr(uploaded)
-        if err:
-            st.error(err)
+df_wip, df_cuota, solo_wip, solo_cuota = None, None, set(), set()
+
+if uploaded:
+    df_wip, df_cuota, err = leer_tim_wipcr(uploaded)
+    if err:
+        st.error(err)
+        df_wip = None
+    else:
+        faltan = [c for c in REQ_WIP_COLS if c not in df_wip.columns]
+        if faltan:
+            st.error(f"Faltan columnas en WIP: {faltan}")
+            df_wip = None
         else:
-            faltan = [c for c in REQ_WIP_COLS if c not in df_wip.columns]
-            if faltan:
-                st.error(f"Faltan columnas en WIP: {faltan}")
-            else:
-                st.success(f"**{uploaded.name}**")
-                st.caption(f"WIP: {len(df_wip):,} filas · {df_wip['DISPO'].nunique():,} dispos")
-                st.caption(f"CUOTA: {len(df_cuota):,} combinaciones PLANTA_WIP+CONSTRUCCION")
+            c1, c2, c3 = st.columns(3)
+            c1.success(f"**{uploaded.name}**")
+            c2.caption(f"WIP: {len(df_wip):,} filas · {df_wip['DISPO'].nunique():,} dispos")
+            c3.caption(f"CUOTA: {len(df_cuota):,} combinaciones PLANTA_WIP+CONSTRUCCION")
 
-                solo_wip, solo_cuota = validar_huerfanos(df_wip, df_cuota)
-                if solo_wip:
-                    st.markdown(f'<div class="warn-box">⚠️ {len(solo_wip)} combinaciones en WIP sin meta en CUOTA (no se les exige ABASTO/CUOTA).</div>', unsafe_allow_html=True)
-                if solo_cuota:
-                    st.markdown(f'<div class="warn-box">⚠️ {len(solo_cuota)} metas en CUOTA sin inventario que las cubra en WIP.</div>', unsafe_allow_html=True)
+            solo_wip, solo_cuota = validar_huerfanos(df_wip, df_cuota)
+            if solo_wip:
+                st.markdown(f'<div class="warn-box">⚠️ {len(solo_wip)} combinaciones en WIP sin meta en CUOTA (no se les exige ABASTO/CUOTA).</div>', unsafe_allow_html=True)
+            if solo_cuota:
+                st.markdown(f'<div class="warn-box">⚠️ {len(solo_cuota)} metas en CUOTA sin inventario que las cubra en WIP.</div>', unsafe_allow_html=True)
 
-                tiene_dia1    = 'PLAN_INS_DIA1' in df_wip.columns
-                tiene_semanal = 'PLAN_INS' in df_wip.columns
-                if not tiene_dia1:
-                    st.markdown('<div class="warn-box">⚠️ Sin PLAN_INS_DIA1 — Escenario 2 = Solo INV.</div>', unsafe_allow_html=True)
-                if not tiene_semanal:
-                    st.markdown('<div class="warn-box">⚠️ Sin PLAN_INS — Escenario 3 = Solo INV.</div>', unsafe_allow_html=True)
+            tiene_dia1    = 'PLAN_INS_DIA1' in df_wip.columns
+            tiene_semanal = 'PLAN_INS' in df_wip.columns
+            if not tiene_dia1:
+                st.markdown('<div class="warn-box">⚠️ Sin PLAN_INS_DIA1 — Escenario 2 = Solo INV.</div>', unsafe_allow_html=True)
+            if not tiene_semanal:
+                st.markdown('<div class="warn-box">⚠️ Sin PLAN_INS — Escenario 3 = Solo INV.</div>', unsafe_allow_html=True)
 
+            with st.expander("👁️ Vista previa WIP", expanded=False):
                 preview_cols = [c for c in ['DISPO', 'ENTREGA', 'PLANTA_WIP', 'CONSTRUCCION', 'ESTILO_EQ',
                                              'DTITULAR', 'LOTSIZE', 'MIX', 'LBS_C', 'INV'] if c in df_wip.columns]
-                st.markdown('<p class="section-title">Vista previa WIP</p>', unsafe_allow_html=True)
                 st.dataframe(df_wip[preview_cols].head(8), use_container_width=True, hide_index=True)
 
-                if st.button("▶ Procesar 3 escenarios", type="primary", use_container_width=True):
-                    targets = construir_targets(df_cuota)
-                    progress_bar = st.progress(0, text="Iniciando…")
-                    resultados = []
-                    n_esc = len(ESCENARIOS)
-                    for ei, esc in enumerate(ESCENARIOS):
-                        base = ei / n_esc
+# ── 2. Configuración ──────────────────────────────────────────────────────────
+entrega_pesos, capacidad_cfg, cascada_activo = dict(DEFAULT_ENTREGA), CAPACIDAD_LOTSIZE, {d: 1 for d in CASCADA_COLOR_NOMBRES}
 
-                        def cb(p, msg, base=base):
-                            progress_bar.progress(min(base + p / n_esc, 1.0), text=f"{esc['label']} — {msg}")
+if df_wip is not None:
+    st.markdown("""
+    <div class="step-header"><div class="step-badge">2</div><div><p class="step-title">Configuración</p></div></div>
+    """, unsafe_allow_html=True)
 
-                        df_sc = motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo,
-                                                  capacidad_cfg, col_extra=esc['col_extra'], progress_cb=cb)
-                        resultados.append({'key': esc['key'], 'label': esc['label'], 'df': df_sc})
-                    progress_bar.progress(1.0, text="Completado ✅")
-                    st.session_state['resultados'] = resultados
-                    st.session_state['huerfanos'] = (solo_wip, solo_cuota)
+    no_config = validar_lotsize_no_configurados(df_wip, st.session_state['cap_df_seed'].to_dict('records'))
+    if not no_config.empty:
+        total_lbs_no_cfg = no_config['LBS_C_TOTAL'].sum()
+        combos_txt = ', '.join(f"{r.LOTSIZE}·{r.MIX}" for r in no_config.itertuples())
+        st.markdown(
+            f'<div class="warn-box">⚠️ {len(no_config)} combinación(es) LOTSIZE+MIX en tus datos NO están en la '
+            f'configuración ({combos_txt}) — {total_lbs_no_cfg:,.0f} lbs en esas líneas quedarán en 0. '
+            f'Agrégalas en la tabla de Capacidad abajo si sí las necesitas.</div>',
+            unsafe_allow_html=True
+        )
 
+    bcol1, bcol2, bcol3 = st.columns(3)
+    with bcol1:
+        if st.button("🔄 Restaurar valores por defecto", use_container_width=True):
+            st.session_state['cap_df_seed']     = default_cap_df()
+            st.session_state['entrega_df_seed'] = default_entrega_df()
+            st.session_state['cascada_df_seed'] = default_cascada_df()
+            st.session_state['cfg_version']    += 1
+            st.rerun()
+    with bcol3:
+        perfil_file = st.file_uploader("Cargar perfil (JSON)", type=['json'],
+                                        label_visibility='collapsed', key='perfil_uploader')
+        if perfil_file is not None:
+            sig = f"{perfil_file.name}_{perfil_file.size}"
+            if st.session_state.get('perfil_aplicado') != sig:
+                try:
+                    data = json.load(perfil_file)
+                    st.session_state['cap_df_seed']     = pd.DataFrame(data['capacidad'])
+                    st.session_state['entrega_df_seed'] = pd.DataFrame(data['entrega'])
+                    st.session_state['cascada_df_seed'] = pd.DataFrame(data['cascada'])
+                    st.session_state['cfg_version']    += 1
+                    st.session_state['perfil_aplicado'] = sig
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Perfil inválido: {e}")
+
+    v = st.session_state['cfg_version']
+
+    with st.expander("📋 Prioridad ENTREGA", expanded=False):
+        st.caption("Menor número = mayor prioridad.")
+        entrega_edit = st.data_editor(
+            st.session_state['entrega_df_seed'], num_rows="fixed", hide_index=True,
+            use_container_width=True, key=f"entrega_editor_{v}",
+            column_config={'PESO': st.column_config.NumberColumn('PESO', min_value=1, max_value=99)}
+        )
+
+    with st.expander("⚙️ Capacidad LOTSIZE + MIX (semanal)", expanded=True):
+        st.caption("Capacidad semanal (lbs) = Lotes/día × 7 × Lbs/lote. Puedes agregar o quitar filas. "
+                   "EVITAR = solo se usa con prioridad normal si ENTREGA=01-EXPEDITE o en Fase ABASTO.")
+        cap_edit = st.data_editor(
+            st.session_state['cap_df_seed'], num_rows="dynamic", hide_index=True,
+            use_container_width=True, key=f"cap_editor_{v}",
+            column_config={
+                'LOTSIZE':      st.column_config.TextColumn('LOTSIZE', required=True),
+                'MIX':          st.column_config.TextColumn('MIX', required=True),
+                'LOTES':        st.column_config.NumberColumn('Lotes/día', min_value=0, step=1),
+                'LBS_POR_LOTE': st.column_config.NumberColumn('Lbs/lote', min_value=0, step=100),
+                'PRIORIDAD':    st.column_config.NumberColumn('Prioridad', min_value=1, step=1),
+                'ACTIVO':       st.column_config.CheckboxColumn('Activo'),
+                'EVITAR':       st.column_config.CheckboxColumn('Evitar'),
+            }
+        )
+        cap_edit = cap_edit.dropna(subset=['LOTSIZE', 'MIX']).copy()
+        for col, default in [('LOTES', 0), ('LBS_POR_LOTE', 0), ('PRIORIDAD', 99), ('ACTIVO', True), ('EVITAR', False)]:
+            if col not in cap_edit.columns:
+                cap_edit[col] = default
+            cap_edit[col] = cap_edit[col].fillna(default)
+        cap_sem_total = (cap_edit['LOTES'] * 7 * cap_edit['LBS_POR_LOTE'] * cap_edit['ACTIVO']).sum()
+        st.caption(f"📦 Capacidad total semanal activa: **{cap_sem_total:,.0f} lbs**")
+
+    with st.expander("🎨 Cascada de color (COLOR_A dígito 3)", expanded=False):
+        st.caption("🔴 Inactivo = ese color no recibe inventario.")
+        cascada_edit = st.data_editor(
+            st.session_state['cascada_df_seed'], num_rows="fixed", hide_index=True,
+            use_container_width=True, key=f"cascada_editor_{v}",
+            column_config={'ACTIVO': st.column_config.CheckboxColumn('Activo')}
+        )
+
+    with bcol2:
+        perfil_export = {
+            'capacidad': cap_edit.to_dict('records'),
+            'entrega': entrega_edit.to_dict('records'),
+            'cascada': cascada_edit.to_dict('records'),
+        }
+        st.download_button(
+            "💾 Exportar perfil (JSON)",
+            data=json.dumps(perfil_export, indent=2, ensure_ascii=False),
+            file_name="perfil_config.json", mime="application/json", use_container_width=True
+        )
+
+    entrega_pesos  = {str(r['ENTREGA']): int(r['PESO']) for _, r in entrega_edit.iterrows()}
+    capacidad_cfg  = cap_edit.to_dict('records')
+    cascada_activo = {str(r['DIGITO']): (1 if r['ACTIVO'] else 0) for _, r in cascada_edit.iterrows()}
+
+    # ── 3. Ejecutar ───────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="step-header"><div class="step-badge">3</div><div><p class="step-title">Ejecutar</p></div></div>
+    """, unsafe_allow_html=True)
+    st.caption("Elige qué escenario(s) correr — menos escenarios = menos tiempo y un Excel más liviano.")
+
+    label_to_esc = {esc['label']: esc for esc in ESCENARIOS}
+    seleccionados = st.multiselect(
+        "Escenarios a ejecutar", options=list(label_to_esc.keys()),
+        default=[ESCENARIOS[-1]['label']], label_visibility="collapsed"
+    )
+
+    if st.button("▶ Ejecutar escenario(s) seleccionados", type="primary",
+                 use_container_width=True, disabled=not seleccionados):
+        targets = construir_targets(df_cuota)
+        progress_bar = st.progress(0, text="Iniciando…")
+        resultados = []
+        n_esc = len(seleccionados)
+        for ei, label in enumerate(seleccionados):
+            esc = label_to_esc[label]
+            base = ei / n_esc
+
+            def cb(p, msg, base=base, esc=esc):
+                progress_bar.progress(min(base + p / n_esc, 1.0), text=f"{esc['label']} — {msg}")
+
+            df_sc = motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo,
+                                      capacidad_cfg, col_extra=esc['col_extra'], progress_cb=cb)
+            resultados.append({'key': esc['key'], 'label': esc['label'], 'df': df_sc})
+        progress_bar.progress(1.0, text="Completado ✅")
+        st.session_state['resultados'] = resultados
+        st.session_state['huerfanos'] = (solo_wip, solo_cuota)
+
+col_main = st.container()
 with col_main:
     if 'resultados' in st.session_state:
         resultados = st.session_state['resultados']
 
         st.markdown('<p class="section-title">Comparativo de escenarios</p>', unsafe_allow_html=True)
-        kpi_cols = st.columns(3)
+        kpi_cols = st.columns(len(resultados))
         sc_cls = ['sc-card-blue', 'sc-card-green', 'sc-card-purple']
         for i, r in enumerate(resultados):
             k = kpis(r['df'])
             with kpi_cols[i]:
                 st.markdown(f"""
-                <div class="sc-card {sc_cls[i]}">
+                <div class="sc-card {sc_cls[i % len(sc_cls)]}">
                   <div class="sc-label">{r['label']}</div>
                   <div class="sc-row"><span class="sc-metric">✅ Completas</span><span class="sc-value">{k['completas']:,}</span></div>
                   <div class="sc-row"><span class="sc-metric">⚠️ Parciales</span><span class="sc-value">{k['parciales']:,}</span></div>
