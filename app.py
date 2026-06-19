@@ -345,66 +345,13 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
     order2 = np.argsort(orden_f2, kind='stable')
 
     n = len(df)
-    asignado = np.zeros(n)
+    asignado = np.zeros(n)          # asignación FINAL — solo de DISPOs ya "cerrados" (completos)
+    locked   = np.zeros(n, dtype=bool)   # True = línea de un DISPO ya cerrado (éxito), no se vuelve a tocar
+    alguna_vez_intento = np.zeros(n, dtype=bool)
 
-    if progress_cb: progress_cb(0.3, "Fase 1 — cubriendo ABASTO por PLANTA_WIP + CONSTRUCCION…")
+    MAX_ITER = 6
+    dispo_series = df['DISPO']
 
-    for i in order1:
-        if activo_color[i] == 0 or not ls_activo_row[i]:
-            continue
-        b = bucket_codes[i]
-        falta_target = abasto_meta[b] - target_asignado[b]
-        if falta_target <= 0:
-            continue
-        m = mach_codes[i]
-        cap_rem = cap_lbs_arr[m] - cap_lbs_usado[m]
-        if cap_rem <= 0:
-            continue
-        p = pool_codes[i]
-        inv_rem = inv_total[p] - inv_used[p]
-        if inv_rem <= 0:
-            continue
-        cant = min(lbs_c[i], falta_target, inv_rem, cap_rem)
-        if cant <= 0:
-            continue
-        asignado[i]        += cant
-        inv_used[p]         += cant
-        target_asignado[b]  += cant
-        cap_lbs_usado[m]    += cant
-
-    if progress_cb: progress_cb(0.65, "Fase 2 — con el restante, completando CUOTA…")
-
-    for i in order2:
-        if activo_color[i] == 0 or not ls_activo_row[i]:
-            continue
-        restante_linea = lbs_c[i] - asignado[i]
-        if restante_linea <= 0:
-            continue
-        b = bucket_codes[i]
-        falta_target = cuota_meta[b] - target_asignado[b]
-        if falta_target <= 0:
-            continue
-        m = mach_codes[i]
-        cap_rem = cap_lbs_arr[m] - cap_lbs_usado[m]
-        if cap_rem <= 0:
-            continue
-        p = pool_codes[i]
-        inv_rem = inv_total[p] - inv_used[p]
-        if inv_rem <= 0:
-            continue
-        cant = min(restante_linea, falta_target, inv_rem, cap_rem)
-        if cant <= 0:
-            continue
-        asignado[i]        += cant
-        inv_used[p]         += cant
-        target_asignado[b]  += cant
-        cap_lbs_usado[m]    += cant
-
-    if progress_cb: progress_cb(0.85, "Aplicando umbral de completitud por DISPO (todo o nada)…")
-
-    # ── Descarte por DISPO: si no se completa, no se asigna ──────────────────
-    # PRINCIPAL debe llegar a umbral_principal; cualquier SECUNDARIO-N a
-    # umbral_secundario. Solo cuentan líneas ACTIVAS con demanda (LBS_C>0).
     if 'COMPONENTE' in df.columns:
         componente_arr = df['COMPONENTE'].astype(str).str.upper().str.strip().to_numpy()
     else:
@@ -412,19 +359,97 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
     es_principal = np.char.find(componente_arr.astype(str), 'PRINCIPAL') >= 0
     umbral_arr   = np.where(es_principal, umbral_principal, umbral_secundario)
 
-    pct_linea_tmp = np.divide(asignado, lbs_c, out=np.ones_like(asignado), where=lbs_c > 0)
-    bloquea = (lbs_c > 0) & (activo_color == 1) & (pct_linea_tmp < umbral_arr)
+    for iteracion in range(MAX_ITER):
+        candidatos = ~locked
+        if not candidatos.any():
+            break
 
-    dispo_bloquea = pd.Series(bloquea, index=df.index).groupby(df['DISPO']).transform('any').to_numpy()
-    dispo_tenia_algo = pd.Series(asignado > 0, index=df.index).groupby(df['DISPO']).transform('any').to_numpy()
+        if progress_cb:
+            progress_cb(0.3 + 0.5 * iteracion / MAX_ITER,
+                        f"Ronda {iteracion + 1}/{MAX_ITER} — completando DISPOs (todo o nada) y liberando lo descartado…")
 
-    descartar = dispo_bloquea  # al menos una línea del DISPO no llegó a su umbral
-    if descartar.any():
-        idx_desc = np.where(descartar)[0]
-        np.subtract.at(target_asignado, bucket_codes[idx_desc], asignado[idx_desc])
-        asignado[idx_desc] = 0.0
+        intento = np.zeros(n)
 
-    df['DISPO_DESCARTADA'] = descartar & dispo_tenia_algo   # tenía algo y se le quitó por no llegar al umbral
+        # Fase 1 (ABASTO) — solo sobre líneas candidatas
+        for i in order1:
+            if not candidatos[i] or activo_color[i] == 0 or not ls_activo_row[i]:
+                continue
+            b = bucket_codes[i]
+            falta_target = abasto_meta[b] - target_asignado[b]
+            if falta_target <= 0:
+                continue
+            m = mach_codes[i]
+            cap_rem = cap_lbs_arr[m] - cap_lbs_usado[m]
+            if cap_rem <= 0:
+                continue
+            p = pool_codes[i]
+            inv_rem = inv_total[p] - inv_used[p]
+            if inv_rem <= 0:
+                continue
+            cant = min(lbs_c[i], falta_target, inv_rem, cap_rem)
+            if cant <= 0:
+                continue
+            intento[i]          += cant
+            inv_used[p]          += cant
+            target_asignado[b]   += cant
+            cap_lbs_usado[m]     += cant
+
+        # Fase 2 (CUOTA) — solo sobre líneas candidatas
+        for i in order2:
+            if not candidatos[i] or activo_color[i] == 0 or not ls_activo_row[i]:
+                continue
+            restante_linea = lbs_c[i] - intento[i]
+            if restante_linea <= 0:
+                continue
+            b = bucket_codes[i]
+            falta_target = cuota_meta[b] - target_asignado[b]
+            if falta_target <= 0:
+                continue
+            m = mach_codes[i]
+            cap_rem = cap_lbs_arr[m] - cap_lbs_usado[m]
+            if cap_rem <= 0:
+                continue
+            p = pool_codes[i]
+            inv_rem = inv_total[p] - inv_used[p]
+            if inv_rem <= 0:
+                continue
+            cant = min(restante_linea, falta_target, inv_rem, cap_rem)
+            if cant <= 0:
+                continue
+            intento[i]          += cant
+            inv_used[p]          += cant
+            target_asignado[b]   += cant
+            cap_lbs_usado[m]     += cant
+
+        alguna_vez_intento |= (intento > 0)
+
+        # ── Evaluar umbral por DISPO (todo o nada) sobre esta ronda ──────────
+        pct_tmp = np.divide(intento, lbs_c, out=np.ones_like(intento), where=lbs_c > 0)
+        bloquea = candidatos & (lbs_c > 0) & (activo_color == 1) & (pct_tmp < umbral_arr)
+        dispo_bloquea    = pd.Series(bloquea, index=df.index).groupby(dispo_series).transform('any').to_numpy()
+        dispo_es_cand    = pd.Series(candidatos, index=df.index).groupby(dispo_series).transform('any').to_numpy()
+        completa_ronda   = dispo_es_cand & ~dispo_bloquea
+
+        idx_lock   = np.where(completa_ronda)[0]
+        idx_revert = np.where(candidatos & ~completa_ronda)[0]
+
+        asignado[idx_lock] = intento[idx_lock]
+        locked[idx_lock]   = True
+
+        if len(idx_revert):
+            # Devolver lo consumido por los DISPOs que NO se completaron esta
+            # ronda, para que la siguiente ronda pueda usarlo en otros DISPOs.
+            np.subtract.at(inv_used,         pool_codes[idx_revert],   intento[idx_revert])
+            np.subtract.at(cap_lbs_usado,    mach_codes[idx_revert],   intento[idx_revert])
+            np.subtract.at(target_asignado,  bucket_codes[idx_revert], intento[idx_revert])
+
+        if len(idx_lock) == 0:
+            break   # sin progreso esta ronda — lo que quede candidato se queda en 0
+
+    if progress_cb: progress_cb(0.85, "Umbral de completitud aplicado…")
+
+    dispo_tenia_algo = pd.Series(alguna_vez_intento, index=df.index).groupby(dispo_series).transform('any').to_numpy()
+    df['DISPO_DESCARTADA'] = (~locked) & dispo_tenia_algo
 
     df['LBS_ASIGNADO'] = asignado
     df['LBS_FALTANTE'] = (df['LBS_C'] - df['LBS_ASIGNADO']).clip(lower=0)
