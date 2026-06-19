@@ -429,6 +429,21 @@ def resumen_capacidad(df_r, capacidad_cfg):
     return cap_df
 
 
+def col_cfg(df, pct_cols=None, num_cols=None, num_fmt='%.1f'):
+    """Construye st.column_config solo para columnas presentes — evita el
+    Styler de pandas (limitado en celdas y frágil con dataframes grandes)."""
+    pct_cols = pct_cols or []
+    num_cols = num_cols or []
+    cfg = {}
+    for c in pct_cols:
+        if c in df.columns:
+            cfg[c] = st.column_config.NumberColumn(c, format="percent")
+    for c in num_cols:
+        if c in df.columns:
+            cfg[c] = st.column_config.NumberColumn(c, format=num_fmt)
+    return cfg
+
+
 def kpis(df_r):
     activas   = df_r[df_r['ACTIVO'] == 1]
     dispo_min = activas.groupby('DISPO')['PCT_LINEA'].min()
@@ -869,10 +884,10 @@ with col_main:
         def semaforo(pct):
             return '🟢 Libre' if pct < 0.7 else ('🟡 Casi saturado' if pct < 1.0 else '🔴 Saturado')
         cap_res2['SEMAFORO'] = cap_res2['PCT_USO'].apply(semaforo)
+        cap_tab = cap_res2[['LOTSIZE', 'MIX', 'ACTIVO', 'LOTES', 'CAPACIDAD_SEMANAL', 'LOTES_USADOS', 'PCT_USO', 'SEMAFORO']]
         st.dataframe(
-            cap_res2[['LOTSIZE', 'MIX', 'ACTIVO', 'LOTES', 'CAPACIDAD_SEMANAL', 'LOTES_USADOS', 'PCT_USO', 'SEMAFORO']]
-            .style.format({'PCT_USO': '{:.1%}'}),
-            use_container_width=True, hide_index=True
+            cap_tab, use_container_width=True, hide_index=True,
+            column_config=col_cfg(cap_tab, pct_cols=['PCT_USO'])
         )
 
         # ── Resumen ABASTO/CUOTA por bucket ──────────────────────────────────
@@ -881,13 +896,17 @@ with col_main:
         for tab, r in zip(tabs_ac, resultados):
             with tab:
                 buckets = resumen_buckets(r['df'])
+                buckets_tab = buckets[['PLANTA_WIP', 'CONSTRUCCION', 'ABASTO_META', 'ABASTO_CUBIERTO', 'PCT_ABASTO',
+                                        'LBS_FALTA_ABASTO', 'CUOTA_META', 'ASIGNADO', 'PCT_CUOTA', 'LBS_FALTA_CUOTA', 'STATUS']]
                 st.dataframe(
-                    buckets[['PLANTA_WIP', 'CONSTRUCCION', 'ABASTO_META', 'ABASTO_CUBIERTO', 'PCT_ABASTO',
-                             'LBS_FALTA_ABASTO', 'CUOTA_META', 'ASIGNADO', 'PCT_CUOTA', 'LBS_FALTA_CUOTA', 'STATUS']]
-                    .style.format({'PCT_ABASTO': '{:.1%}', 'PCT_CUOTA': '{:.1%}',
-                                    'ABASTO_META': '{:,.0f}', 'ABASTO_CUBIERTO': '{:,.0f}', 'LBS_FALTA_ABASTO': '{:,.0f}',
-                                    'CUOTA_META': '{:,.0f}', 'ASIGNADO': '{:,.0f}', 'LBS_FALTA_CUOTA': '{:,.0f}'}),
-                    use_container_width=True, hide_index=True, height=380
+                    buckets_tab, use_container_width=True, hide_index=True, height=380,
+                    column_config=col_cfg(
+                        buckets_tab,
+                        pct_cols=['PCT_ABASTO', 'PCT_CUOTA'],
+                        num_cols=['ABASTO_META', 'ABASTO_CUBIERTO', 'LBS_FALTA_ABASTO',
+                                  'CUOTA_META', 'ASIGNADO', 'LBS_FALTA_CUOTA'],
+                        num_fmt='%.0f'
+                    )
                 )
 
         # ── Tabla detalle por escenario ───────────────────────────────────────
@@ -926,13 +945,15 @@ with col_main:
                                df_r['ENTREGA'].isin(filtro_entrega)]
 
                 cols_show = [c for c in cols_show_base if c in df_r.columns]
+                df_show = df_vis[cols_show]
                 st.dataframe(
-                    df_vis[cols_show].style.format({
-                        'PCT_LINEA': '{:.1%}', 'PCT_ABASTO': '{:.1%}', 'PCT_CUOTA': '{:.1%}',
-                        'LBS_C': '{:,.1f}', 'LBS_ASIGNADO': '{:,.1f}', 'LBS_FALTANTE': '{:,.1f}',
-                        'INV_EFECTIVO': '{:,.0f}',
-                    }),
-                    use_container_width=True, hide_index=True, height=380
+                    df_show, use_container_width=True, hide_index=True, height=380,
+                    column_config=col_cfg(
+                        df_show,
+                        pct_cols=['PCT_LINEA', 'PCT_ABASTO', 'PCT_CUOTA'],
+                        num_cols=['LBS_C', 'LBS_ASIGNADO', 'LBS_FALTANTE'],
+                        num_fmt='%.1f'
+                    ) | col_cfg(df_show, num_cols=['INV_EFECTIVO'], num_fmt='%.0f')
                 )
                 st.caption(f"{len(df_vis):,} líneas · {df_vis['DISPO'].nunique():,} dispos")
 
