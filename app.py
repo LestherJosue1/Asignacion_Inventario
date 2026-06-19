@@ -144,8 +144,11 @@ REQ_WIP_COLS = ['DISPO', 'ENTREGA', 'ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV',
 # todas al Excel multiplica el tamaño de la hoja DETALLE y puede tumbar la app
 # en Streamlit Cloud (memoria/tiempo) con datasets grandes.
 ESSENTIAL_ORIG_COLS = ['DISPO', 'ENTREGA', 'PLANTA_WIP', 'CONSTRUCCION', 'LOTSIZE', 'MIX',
-                        'ESTILO_EQ', 'DTITULAR', 'COLOR_A', 'LBS_C', 'INV',
+                        'ESTILO_EQ', 'DTITULAR', 'COLOR_A', 'COMPONENTE', 'LBS_C', 'INV',
                         'PLAN_INS_DIA1', 'PLAN_INS']
+
+UMBRAL_PRINCIPAL_DEFAULT  = 0.95   # % mínimo para considerar COMPLETO un componente PRINCIPAL
+UMBRAL_SECUNDARIO_DEFAULT = 0.97   # % mínimo para considerar COMPLETO un componente SECUNDARIO-N
 
 # ── Lectura del workbook TIM_WIPCR ──────────────────────────────────────────────
 def leer_tim_wipcr(file):
@@ -227,13 +230,20 @@ def extraer_digito3(color_a):
 
 # ── Motor de asignación en 2 fases (ABASTO → CUOTA) ─────────────────────────────
 def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_cfg,
-                      col_extra=None, progress_cb=None):
+                      col_extra=None, progress_cb=None,
+                      umbral_principal=UMBRAL_PRINCIPAL_DEFAULT, umbral_secundario=UMBRAL_SECUNDARIO_DEFAULT):
     """
     Asigna inventario en 2 fases por combinación PLANTA_WIP+CONSTRUCCION:
       Fase 1: cubrir ABASTO (col I de CUOTA)
       Fase 2: con lo que sobra, cubrir CUOTA (col K de CUOTA), sin redistribuir fase 1.
     Respeta capacidad semanal por LOTSIZE+MIX (lotes_dia*7) y el pool físico de
     inventario por ESTILO_EQ+DTITULAR.
+
+    Al final, evalúa cada DISPO completo: si TODAS sus líneas activas con
+    demanda alcanzan su umbral (PRINCIPAL ≥ umbral_principal, cualquier
+    SECUNDARIO-N ≥ umbral_secundario), se conserva la asignación. Si alguna
+    línea se queda corta, se descarta el DISPO entero (todas sus líneas a 0)
+    — "si no se completa, no se asigna".
     """
     df = df_wip.copy()
     df.columns = df.columns.str.strip().str.upper()
@@ -390,7 +400,31 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
         target_asignado[b]  += cant
         cap_lbs_usado[m]    += cant
 
-    if progress_cb: progress_cb(0.9, "Calculando métricas de cobertura…")
+    if progress_cb: progress_cb(0.85, "Aplicando umbral de completitud por DISPO (todo o nada)…")
+
+    # ── Descarte por DISPO: si no se completa, no se asigna ──────────────────
+    # PRINCIPAL debe llegar a umbral_principal; cualquier SECUNDARIO-N a
+    # umbral_secundario. Solo cuentan líneas ACTIVAS con demanda (LBS_C>0).
+    if 'COMPONENTE' in df.columns:
+        componente_arr = df['COMPONENTE'].astype(str).str.upper().str.strip().to_numpy()
+    else:
+        componente_arr = np.full(len(df), 'PRINCIPAL')
+    es_principal = np.char.find(componente_arr.astype(str), 'PRINCIPAL') >= 0
+    umbral_arr   = np.where(es_principal, umbral_principal, umbral_secundario)
+
+    pct_linea_tmp = np.divide(asignado, lbs_c, out=np.ones_like(asignado), where=lbs_c > 0)
+    bloquea = (lbs_c > 0) & (activo_color == 1) & (pct_linea_tmp < umbral_arr)
+
+    dispo_bloquea = pd.Series(bloquea, index=df.index).groupby(df['DISPO']).transform('any').to_numpy()
+    dispo_tenia_algo = pd.Series(asignado > 0, index=df.index).groupby(df['DISPO']).transform('any').to_numpy()
+
+    descartar = dispo_bloquea  # al menos una línea del DISPO no llegó a su umbral
+    if descartar.any():
+        idx_desc = np.where(descartar)[0]
+        np.subtract.at(target_asignado, bucket_codes[idx_desc], asignado[idx_desc])
+        asignado[idx_desc] = 0.0
+
+    df['DISPO_DESCARTADA'] = descartar & dispo_tenia_algo   # tenía algo y se le quitó por no llegar al umbral
 
     df['LBS_ASIGNADO'] = asignado
     df['LBS_FALTANTE'] = (df['LBS_C'] - df['LBS_ASIGNADO']).clip(lower=0)
@@ -415,20 +449,18 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
         default='🔴 NI ABASTO'
     )
 
-    # Status a nivel línea/DISPO (cobertura física, igual filosofía que v1)
+    # Status a nivel línea/DISPO — ahora refleja el umbral relajado (95%/97%)
+    # y distingue "se descartó por no llegar al umbral" de "nunca tuvo nada".
     activas_mask = df['ACTIVO'] == 1
     pct_min = df[activas_mask].groupby('DISPO')['PCT_LINEA'].min().rename('_min_pct')
     df = df.merge(pct_min, on='DISPO', how='left')
     df['_min_pct'] = df['_min_pct'].fillna(-1)
 
-    def status_dispo(row):
-        if row['ACTIVO'] == 0: return '⛔ INACTIVA'
-        p = row['_min_pct']
-        if p < 0:  return '⛔ INACTIVA'
-        if p >= 1: return '✅ COMPLETA'
-        if p > 0:  return '⚠️ PARCIAL'
-        return '❌ SIN INVENTARIO'
-    df['STATUS_DISPO'] = df.apply(status_dispo, axis=1)
+    df['STATUS_DISPO'] = np.select(
+        [df['ACTIVO'] == 0, df['DISPO_DESCARTADA'], df['_min_pct'] > 0],
+        ['⛔ INACTIVA', '🔁 DESCARTADA (no llegó al umbral)', '✅ COMPLETA'],
+        default='❌ SIN INVENTARIO'
+    )
 
     pct_dispo = (
         df[activas_mask].groupby('DISPO')['LBS_ASIGNADO'].sum() /
@@ -512,17 +544,17 @@ def col_cfg(df, pct_cols=None, num_cols=None, num_fmt='%.1f'):
 
 
 def kpis(df_r):
-    activas   = df_r[df_r['ACTIVO'] == 1]
-    dispo_min = activas.groupby('DISPO')['PCT_LINEA'].min()
-    total_d   = dispo_min.count()
-    buckets   = resumen_buckets(df_r)
+    activas = df_r[df_r['ACTIVO'] == 1]
+    status_por_dispo = activas.drop_duplicates('DISPO')['STATUS_DISPO']
+    total_d = status_por_dispo.shape[0]
+    buckets = resumen_buckets(df_r)
     return {
-        'total':     total_d,
-        'completas': (dispo_min >= 1).sum(),
-        'parciales': ((dispo_min > 0) & (dispo_min < 1)).sum(),
-        'sin_inv':   (dispo_min == 0).sum(),
-        'inactivas': (df_r['ACTIVO'] == 0).sum(),
-        'cob':       activas['LBS_ASIGNADO'].sum() / activas['LBS_C'].sum() if len(activas) else 0,
+        'total':      total_d,
+        'completas':  (status_por_dispo == '✅ COMPLETA').sum(),
+        'descartadas': (status_por_dispo == '🔁 DESCARTADA (no llegó al umbral)').sum(),
+        'sin_inv':    (status_por_dispo == '❌ SIN INVENTARIO').sum(),
+        'inactivas':  (df_r['ACTIVO'] == 0).sum(),
+        'cob':        activas['LBS_ASIGNADO'].sum() / activas['LBS_C'].sum() if len(activas) else 0,
         'buckets_full':  (buckets['STATUS'] == '✅ ABASTO+CUOTA').sum(),
         'buckets_abasto':(buckets['STATUS'] == '🟡 SOLO ABASTO').sum(),
         'buckets_ni':    (buckets['STATUS'] == '🔴 NI ABASTO').sum(),
@@ -577,7 +609,7 @@ def formato_detalle(ws, df_out, n_orig, st_):
                                         for k in ('ok', 'warn', 'err', 'inac'))
         reglas = [
             (f'${s_col}2="✅ COMPLETA"', f_ok),
-            (f'${s_col}2="⚠️ PARCIAL"', f_warn),
+            (f'${s_col}2="🔁 DESCARTADA (no llegó al umbral)"', f_warn),
             (f'${s_col}2="❌ SIN INVENTARIO"', f_err),
             (f'${s_col}2="⛔ INACTIVA"', f_inac),
         ]
@@ -715,7 +747,7 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
             k = kpis(r['df'])
             resumen_rows.append({
                 'Escenario': r['label'], 'DISPOs totales': k['total'],
-                '✅ Completas': k['completas'], '⚠️ Parciales': k['parciales'],
+                '✅ Completas': k['completas'], '🔁 Descartadas (no llegó al umbral)': k['descartadas'],
                 '❌ Sin inventario': k['sin_inv'], '⛔ Líneas inactivas': k['inactivas'],
                 '% Cobertura física': f"{k['cob']:.1%}",
                 'Buckets ✅ ABASTO+CUOTA': k['buckets_full'],
@@ -980,6 +1012,24 @@ if df_wip is not None:
             column_config={'ACTIVO': st.column_config.CheckboxColumn('Activo')}
         )
 
+    with st.expander("🎯 Umbral de completitud por DISPO (todo o nada)", expanded=False):
+        st.caption("Si un DISPO no llega al umbral en TODAS sus líneas activas, se descarta completo (0 lbs). "
+                   "Se basa en la columna COMPONENTE de WIP (PRINCIPAL vs SECUNDARIO-N). Si esa columna no existe, "
+                   "todo se trata como PRINCIPAL.")
+        uc1, uc2 = st.columns(2)
+        with uc1:
+            umbral_principal_pct = st.number_input(
+                "Umbral componente PRINCIPAL (%)", min_value=50, max_value=100,
+                value=int(UMBRAL_PRINCIPAL_DEFAULT * 100), step=1, key=f"umbral_p_{v}"
+            )
+        with uc2:
+            umbral_secundario_pct = st.number_input(
+                "Umbral componente SECUNDARIO-N (%)", min_value=50, max_value=100,
+                value=int(UMBRAL_SECUNDARIO_DEFAULT * 100), step=1, key=f"umbral_s_{v}"
+            )
+        umbral_principal  = umbral_principal_pct / 100.0
+        umbral_secundario = umbral_secundario_pct / 100.0
+
     with bcol2:
         perfil_export = {
             'capacidad': cap_edit.to_dict('records'),
@@ -1022,7 +1072,8 @@ if df_wip is not None:
                 progress_bar.progress(min(base + p / n_esc, 1.0), text=f"{esc['label']} — {msg}")
 
             df_sc = motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo,
-                                      capacidad_cfg, col_extra=esc['col_extra'], progress_cb=cb)
+                                      capacidad_cfg, col_extra=esc['col_extra'], progress_cb=cb,
+                                      umbral_principal=umbral_principal, umbral_secundario=umbral_secundario)
             resultados.append({'key': esc['key'], 'label': esc['label'], 'df': df_sc})
         progress_bar.progress(1.0, text="Completado ✅")
         st.session_state['resultados'] = resultados
@@ -1043,7 +1094,7 @@ with col_main:
                 <div class="sc-card {sc_cls[i % len(sc_cls)]}">
                   <div class="sc-label">{r['label']}</div>
                   <div class="sc-row"><span class="sc-metric">✅ Completas</span><span class="sc-value">{k['completas']:,}</span></div>
-                  <div class="sc-row"><span class="sc-metric">⚠️ Parciales</span><span class="sc-value">{k['parciales']:,}</span></div>
+                  <div class="sc-row"><span class="sc-metric">🔁 Descartadas (no llegó al umbral)</span><span class="sc-value">{k['descartadas']:,}</span></div>
                   <div class="sc-row"><span class="sc-metric">❌ Sin inventario</span><span class="sc-value">{k['sin_inv']:,}</span></div>
                   <div class="sc-row"><span class="sc-metric">⛔ Inactivas</span><span class="sc-value">{k['inactivas']:,}</span></div>
                   <div class="sc-row sc-divider"><span class="sc-metric">Cobertura física</span><span class="sc-value">{k['cob']:.1%}</span></div>
@@ -1157,8 +1208,8 @@ with col_main:
                 fc1, fc2, fc3 = st.columns(3)
                 with fc1:
                     filtro_status = st.multiselect(
-                        "Status", ['✅ COMPLETA', '⚠️ PARCIAL', '❌ SIN INVENTARIO', '⛔ INACTIVA'],
-                        default=['✅ COMPLETA', '⚠️ PARCIAL', '❌ SIN INVENTARIO', '⛔ INACTIVA'],
+                        "Status", ['✅ COMPLETA', '🔁 DESCARTADA (no llegó al umbral)', '❌ SIN INVENTARIO', '⛔ INACTIVA'],
+                        default=['✅ COMPLETA', '🔁 DESCARTADA (no llegó al umbral)', '❌ SIN INVENTARIO', '⛔ INACTIVA'],
                         key=f"fs_{r['key']}", label_visibility="collapsed"
                     )
                 with fc2:
