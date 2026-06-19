@@ -104,14 +104,8 @@ CAPACIDAD_LOTSIZE = [
     {'LOTSIZE': 'C-2600', 'MIX': 'DYE',    'LOTES': 38, 'PRIORIDAD': 3, 'ACTIVO': True,  'EVITAR': False},
     {'LOTSIZE': 'D-2200', 'MIX': 'DYE',    'LOTES': 29, 'PRIORIDAD': 4, 'ACTIVO': True,  'EVITAR': False},
     {'LOTSIZE': 'D-2200', 'MIX': 'BLEACH', 'LOTES': 14, 'PRIORIDAD': 1, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'F-2200', 'MIX': 'DYE',    'LOTES':  0, 'PRIORIDAD': 5, 'ACTIVO': False, 'EVITAR': False},
-    {'LOTSIZE': 'F-2200', 'MIX': 'BLEACH', 'LOTES':  0, 'PRIORIDAD': 5, 'ACTIVO': False, 'EVITAR': False},
     {'LOTSIZE': 'F-1000', 'MIX': 'DYE',    'LOTES': 33, 'PRIORIDAD': 6, 'ACTIVO': True,  'EVITAR': False},
     {'LOTSIZE': 'F-1000', 'MIX': 'BLEACH', 'LOTES':  7, 'PRIORIDAD': 2, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'E-1100', 'MIX': 'DYE',    'LOTES':  0, 'PRIORIDAD': 90, 'ACTIVO': False, 'EVITAR': True},
-    {'LOTSIZE': 'E-1100', 'MIX': 'BLEACH', 'LOTES':  0, 'PRIORIDAD': 90, 'ACTIVO': False, 'EVITAR': True},
-    {'LOTSIZE': 'G-1100', 'MIX': 'DYE',    'LOTES':  0, 'PRIORIDAD': 91, 'ACTIVO': False, 'EVITAR': True},
-    {'LOTSIZE': 'G-1100', 'MIX': 'BLEACH', 'LOTES':  0, 'PRIORIDAD': 91, 'ACTIVO': False, 'EVITAR': True},
 ]
 
 CASCADA_COLOR_NOMBRES = {
@@ -738,8 +732,9 @@ with st.sidebar:
                                       label_visibility='collapsed')
         capacidad_cfg.append({**row, 'LOTES': lotes, 'ACTIVO': activo_ls})
 
-    st.markdown('<div class="evitar-box">⚠️ E-1100 / G-1100: se evitan salvo ENTREGA=01-EXPEDITE o que la línea esté en Fase ABASTO. F-2200, E-1100, G-1100 vienen en 0 lotes/día — captura el valor real antes de correr.</div>',
-                unsafe_allow_html=True)
+    if any(r['EVITAR'] for r in CAPACIDAD_LOTSIZE):
+        st.markdown('<div class="evitar-box">⚠️ Las filas marcadas EVITAR solo se habilitan con prioridad normal si ENTREGA=01-EXPEDITE o la línea está en Fase ABASTO.</div>',
+                    unsafe_allow_html=True)
 
     st.markdown('<p class="section-title">Cascada de color (COLOR_A dígito 3)</p>', unsafe_allow_html=True)
     st.markdown('<div class="warn-box">🔴 INACTIVO = no recibe inventario.</div>', unsafe_allow_html=True)
