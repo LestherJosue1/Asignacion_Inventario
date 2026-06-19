@@ -5,6 +5,7 @@ from datetime import datetime
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import FormulaRule
 import io
 
 try:
@@ -122,6 +123,14 @@ ESCENARIOS = [
 
 REQ_WIP_COLS = ['DISPO', 'ENTREGA', 'ESTILO_EQ', 'DTITULAR', 'LBS_C', 'INV',
                 'LOTSIZE', 'MIX', 'PLANTA_WIP', 'CONSTRUCCION']
+
+# Columnas crudas de WIP que sí queremos en el Excel — WIP trae ~74 columnas y
+# la mayoría (RATE, FORMULA, CLAVE2, etc.) no se usan en esta app. Mandarlas
+# todas al Excel multiplica el tamaño de la hoja DETALLE y puede tumbar la app
+# en Streamlit Cloud (memoria/tiempo) con datasets grandes.
+ESSENTIAL_ORIG_COLS = ['DISPO', 'ENTREGA', 'PLANTA_WIP', 'CONSTRUCCION', 'LOTSIZE', 'MIX',
+                        'ESTILO_EQ', 'DTITULAR', 'COLOR_A', 'LBS_C', 'INV',
+                        'PLAN_INS_DIA1', 'PLAN_INS']
 
 # ── Lectura del workbook TIM_WIPCR ──────────────────────────────────────────────
 def leer_tim_wipcr(file):
@@ -498,8 +507,14 @@ def make_styles():
 
 
 def formato_detalle(ws, df_out, n_orig, st_):
-    FW, FN, FI, brd = st_['FW'], st_['FN'], st_['FI'], st_['brd']
-    for col_idx in range(1, len(df_out.columns) + 1):
+    """Formatea la hoja DETALLE. Usa formato condicional de Excel (evaluado
+    por Excel al abrir, no celda-por-celda en Python) para que funcione bien
+    con decenas de miles de filas sin tronar por memoria/tiempo."""
+    FW, brd = st_['FW'], st_['brd']
+    n_cols = len(df_out.columns)
+    last_col_letter = get_column_letter(n_cols)
+
+    for col_idx in range(1, n_cols + 1):
         c = ws.cell(row=1, column=col_idx)
         c.fill = PatternFill('solid', start_color=COLOR_H['new'] if col_idx > n_orig else COLOR_H['orig'])
         c.font = FW
@@ -509,24 +524,29 @@ def formato_detalle(ws, df_out, n_orig, st_):
     ws.freeze_panes = 'A2'
     ws.auto_filter.ref = ws.dimensions
 
-    s_idx = df_out.columns.get_loc('STATUS_DISPO') + 1
-    f_ok, f_warn, f_err, f_inac = (PatternFill('solid', start_color=COLOR_ROW[k])
-                                    for k in ('ok', 'warn', 'err', 'inac'))
-    pct_cols = [c for c in ('PCT_LINEA', 'PCT_DISPO', 'PCT_ABASTO', 'PCT_CUOTA') if c in df_out.columns]
-    pct_idx  = [df_out.columns.get_loc(c) + 1 for c in pct_cols]
+    n_rows = ws.max_row
+    if n_rows >= 2 and 'STATUS_DISPO' in df_out.columns:
+        s_idx = df_out.columns.get_loc('STATUS_DISPO') + 1
+        s_col = get_column_letter(s_idx)
+        data_range = f"A2:{last_col_letter}{n_rows}"
+        f_ok, f_warn, f_err, f_inac = (PatternFill('solid', start_color=COLOR_ROW[k])
+                                        for k in ('ok', 'warn', 'err', 'inac'))
+        reglas = [
+            (f'${s_col}2="✅ COMPLETA"', f_ok),
+            (f'${s_col}2="⚠️ PARCIAL"', f_warn),
+            (f'${s_col}2="❌ SIN INVENTARIO"', f_err),
+            (f'${s_col}2="⛔ INACTIVA"', f_inac),
+        ]
+        for formula, fill in reglas:
+            ws.conditional_formatting.add(data_range, FormulaRule(formula=[formula], fill=fill))
 
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        status  = row[s_idx - 1].value
-        is_inac = status == '⛔ INACTIVA'
-        fill    = f_inac if is_inac else f_ok if status == '✅ COMPLETA' else f_warn if status == '⚠️ PARCIAL' else f_err
-        for cell in row:
-            cell.font   = FI if is_inac else FN
-            cell.border = brd
-            if cell.column > n_orig:
-                cell.fill      = fill
-                cell.alignment = Alignment(horizontal='center')
-        for pi in pct_idx:
-            row[pi - 1].number_format = '0.0%'
+    # Formato de porcentaje — solo en las columnas % (no toda la hoja)
+    pct_cols = [c for c in ('PCT_LINEA', 'PCT_DISPO', 'PCT_ABASTO', 'PCT_CUOTA') if c in df_out.columns]
+    for pc in pct_cols:
+        pi = df_out.columns.get_loc(pc) + 1
+        col_letter = get_column_letter(pi)
+        for cell in ws[col_letter][1:]:   # salta encabezado
+            cell.number_format = '0.0%'
 
     for i, col_name in enumerate(df_out.columns, 1):
         w = (18 if col_name in ('DISPO', 'ESTILO_EQ', 'ENTREGA', 'LOTSIZE', 'STATUS_DISPO', 'STATUS_AC',
@@ -636,13 +656,14 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
         frames.append(df_sc)
     df_all = pd.concat(frames, ignore_index=True)
 
-    orig_cols = [c for c in df_all.columns if c not in new_cols and c != 'ESCENARIO']
+    orig_cols = [c for c in ESSENTIAL_ORIG_COLS if c in df_all.columns]
     col_order = ['ESCENARIO'] + orig_cols + [c for c in new_cols if c in df_all.columns]
     df_out = df_all[col_order].copy()
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-        df_out.to_excel(writer, sheet_name='DETALLE', index=False)
+        # DETALLE se construye directo con openpyxl más abajo (mucho más rápido
+        # que pandas.to_excel + recarga cuando hay decenas de miles de filas).
         pd.DataFrame().to_excel(writer, sheet_name='REPORTE', index=False)
 
         resumen_rows = []
@@ -692,7 +713,11 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
     buf.seek(0)
     wb = load_workbook(buf)
 
-    ws = wb['DETALLE']
+    ws = wb.create_sheet('DETALLE', 0)
+    ws.append(list(df_out.columns))
+    df_out_clean = df_out.astype(object).where(df_out.notna(), None)
+    for row_vals in df_out_clean.itertuples(index=False, name=None):
+        ws.append(row_vals)
     n_orig = 1 + len(orig_cols)
     formato_detalle(ws, df_out, n_orig, st_)
     ws.cell(row=1, column=1).fill = PatternFill('solid', start_color=COLOR_H['cfg'])
@@ -1024,15 +1049,28 @@ with col_main:
         # ── Descargar ─────────────────────────────────────────────────────────
         st.markdown('<p class="section-title">Descargar resultado</p>', unsafe_allow_html=True)
         ts = datetime.now().strftime('%Y%m%d%H%M')
-        excel_bytes = generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg,
-                                     huerfanos_info=st.session_state.get('huerfanos'))
-        st.download_button(
-            label=f"⬇️  Descargar Excel — ASIGNACION_ABASTO_CUOTA_{ts}.xlsx",
-            data=excel_bytes,
-            file_name=f"ASIGNACION_ABASTO_CUOTA_{ts}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+
+        fingerprint = tuple(r['df'].shape for r in resultados)
+        if st.session_state.get('excel_fingerprint') != fingerprint:
+            st.session_state['excel_bytes'] = None
+
+        if st.button("📦 Preparar archivo Excel", use_container_width=True):
+            with st.spinner("Generando Excel… con datasets grandes puede tardar unos segundos."):
+                excel_buf = generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg,
+                                           huerfanos_info=st.session_state.get('huerfanos'))
+                st.session_state['excel_bytes'] = excel_buf.getvalue()
+                st.session_state['excel_fingerprint'] = fingerprint
+
+        if st.session_state.get('excel_bytes'):
+            st.download_button(
+                label=f"⬇️  Descargar Excel — ASIGNACION_ABASTO_CUOTA_{ts}.xlsx",
+                data=st.session_state['excel_bytes'],
+                file_name=f"ASIGNACION_ABASTO_CUOTA_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        else:
+            st.caption("Da clic en \"Preparar archivo Excel\" para generarlo y habilitar la descarga.")
 
     else:
         st.markdown("""
