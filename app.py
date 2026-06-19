@@ -320,10 +320,16 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
 
     ls_activo_row = ls_activo_arr[mach_codes]
 
-    # ── Orden de prioridad: ENTREGA primero, luego preferencia de máquina ──
-    orden_f1 = peso_e * 1000 + prioridad_arr[mach_codes] * 10               # Fase ABASTO: evitar SIEMPRE override
-    orden_f2 = peso_e * 1000 + (prioridad_arr[mach_codes] +
-               np.where(evitar_arr[mach_codes] & ~es_expedite, 90, 0)) * 10  # Fase CUOTA: solo override si EXPEDITE
+    # ── Orden de prioridad: ENTREGA del DISPO → agrupar TODO el DISPO junto →
+    # preferencia de máquina dentro del DISPO. Esto hace que el motor complete
+    # un pedido (todas sus líneas de color) antes de tocar el siguiente, en vez
+    # de repartir el pool en migajas entre muchos DISPOs a la vez.
+    dispo_codes, _ = pd.factorize(df['DISPO'].astype(str), sort=True)
+    peso_e_dispo = pd.Series(peso_e, index=df.index).groupby(df['DISPO']).transform('min').to_numpy()
+
+    orden_f1 = peso_e_dispo * 1e8 + dispo_codes * 1000 + prioridad_arr[mach_codes]               # Fase ABASTO: evitar SIEMPRE override
+    orden_f2 = peso_e_dispo * 1e8 + dispo_codes * 1000 + (prioridad_arr[mach_codes] +
+               np.where(evitar_arr[mach_codes] & ~es_expedite, 90, 0))  # Fase CUOTA: solo override si EXPEDITE
 
     order1 = np.argsort(orden_f1, kind='stable')
     order2 = np.argsort(orden_f2, kind='stable')
