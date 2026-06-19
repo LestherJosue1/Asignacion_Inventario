@@ -429,6 +429,20 @@ def resumen_capacidad(df_r, capacidad_cfg):
     return cap_df
 
 
+def resumen_inventario_libre(df_r):
+    """Por ESTILO_EQ + DTITULAR: cuánto del pool físico (INV + plan del
+    escenario) quedó SIN asignar — inventario/plan libre que no se usó."""
+    g = df_r.groupby(['ESTILO_EQ', 'DTITULAR']).agg(
+        INV_EFECTIVO=('INV_EFECTIVO', 'first'),
+        LBS_C_TOTAL=('LBS_C', 'sum'),
+        LBS_ASIGNADO_TOTAL=('LBS_ASIGNADO', 'sum'),
+        N_LINEAS=('DISPO', 'count'),
+    ).reset_index()
+    g['INV_LIBRE']   = (g['INV_EFECTIVO'] - g['LBS_ASIGNADO_TOTAL']).clip(lower=0)
+    g['PCT_USO_POOL'] = np.where(g['INV_EFECTIVO'] > 0, g['LBS_ASIGNADO_TOTAL'] / g['INV_EFECTIVO'], 0)
+    return g.sort_values('INV_LIBRE', ascending=False)
+
+
 def col_cfg(df, pct_cols=None, num_cols=None, num_fmt='%.1f'):
     """Construye st.column_config solo para columnas presentes — evita el
     Styler de pandas (limitado en celdas y frágil con dataframes grandes)."""
@@ -659,6 +673,15 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
         cfg_ls.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=3)
         cfg_cascada.to_excel(writer, sheet_name='CONFIG', index=False, startrow=1, startcol=12)
 
+        libre_frames = []
+        for r in resultados:
+            libre_r = resumen_inventario_libre(r['df'])
+            libre_r.insert(0, 'ESCENARIO', r['label'])
+            libre_frames.append(libre_r)
+        df_libre = pd.concat(libre_frames, ignore_index=True).sort_values(
+            ['ESCENARIO', 'INV_LIBRE'], ascending=[True, False])
+        df_libre.to_excel(writer, sheet_name='INV_LIBRE', index=False)
+
         if huerfanos_info:
             solo_wip, solo_cuota = huerfanos_info
             pd.DataFrame(sorted(solo_wip), columns=['PLANTA_WIP', 'CONSTRUCCION']).to_excel(
@@ -690,6 +713,27 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
                 if cell.column == 1 and 0 <= sc_idx < len(sc_fills):
                     cell.fill = sc_fills[sc_idx]
                     cell.font = Font(color='FFFFFF', bold=True, name='Arial', size=9)
+
+    ws_libre = wb['INV_LIBRE']
+    for col_idx in range(1, len(df_libre.columns) + 1):
+        c = ws_libre.cell(row=1, column=col_idx)
+        c.font = FW; c.fill = PatternFill('solid', start_color=COLOR_H['cfg'])
+        c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        c.border = brd
+    ws_libre.freeze_panes = 'A2'
+    ws_libre.auto_filter.ref = ws_libre.dimensions
+    libre_idx = df_libre.columns.get_loc('INV_LIBRE') + 1
+    pct_idx_libre = df_libre.columns.get_loc('PCT_USO_POOL') + 1
+    f_libre = PatternFill('solid', start_color=COLOR_ROW['warn'])
+    for row in ws_libre.iter_rows(min_row=2, max_row=ws_libre.max_row):
+        for cell in row:
+            cell.font = FN; cell.border = brd
+        row[pct_idx_libre - 1].number_format = '0.0%'
+        if isinstance(row[libre_idx - 1].value, (int, float)) and row[libre_idx - 1].value > 0:
+            row[libre_idx - 1].fill = f_libre
+    for i, col_name in enumerate(df_libre.columns, 1):
+        w = 18 if col_name in ('ESCENARIO', 'ESTILO_EQ', 'DTITULAR') else 16
+        ws_libre.column_dimensions[get_column_letter(i)].width = w
 
     ws_c = wb['CONFIG']
     titulos = {1: 'PRIORIDAD ENTREGA', 4: 'CAPACIDAD LOTSIZE+MIX (semanal = diaria×7)', 13: 'CASCADA DE COLOR'}
@@ -908,6 +952,26 @@ with col_main:
                         num_fmt='%.0f'
                     )
                 )
+
+        # ── Inventario / plan libre por ESTILO_EQ + DTITULAR ──────────────────
+        st.markdown('<p class="section-title">Inventario + plan libre (sin asignar) por ESTILO_EQ + DTITULAR</p>', unsafe_allow_html=True)
+        tabs_libre = st.tabs([r['label'] for r in resultados])
+        for tab, r in zip(tabs_libre, resultados):
+            with tab:
+                libre = resumen_inventario_libre(r['df'])
+                solo_con_libre = st.checkbox("Mostrar solo los que tienen inventario libre (> 0)",
+                                              value=True, key=f"libre_chk_{r['key']}")
+                libre_vis = libre[libre['INV_LIBRE'] > 0] if solo_con_libre else libre
+                st.dataframe(
+                    libre_vis, use_container_width=True, hide_index=True, height=380,
+                    column_config=col_cfg(
+                        libre_vis,
+                        pct_cols=['PCT_USO_POOL'],
+                        num_cols=['INV_EFECTIVO', 'LBS_C_TOTAL', 'LBS_ASIGNADO_TOTAL', 'INV_LIBRE'],
+                        num_fmt='%.0f'
+                    )
+                )
+                st.caption(f"{len(libre_vis):,} combinaciones · {libre_vis['INV_LIBRE'].sum():,.0f} lbs libres en total")
 
         # ── Tabla detalle por escenario ───────────────────────────────────────
         st.markdown('<p class="section-title">Detalle por línea</p>', unsafe_allow_html=True)
