@@ -99,14 +99,16 @@ DEFAULT_ENTREGA = {
 }
 
 # EVITAR=True → solo se habilita con prioridad normal si ENTREGA=01-EXPEDITE o estamos en Fase ABASTO
+# LBS_POR_LOTE = capacidad en libras de UNA corrida/lote de ese LOTSIZE (ej. "A-4000" → 4000 lbs/lote).
+# La capacidad semanal real = LOTES (lotes/día) × 7 × LBS_POR_LOTE.
 CAPACIDAD_LOTSIZE = [
-    {'LOTSIZE': 'A-4000', 'MIX': 'DYE',    'LOTES':  4, 'PRIORIDAD': 1, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'B-3300', 'MIX': 'DYE',    'LOTES':  8, 'PRIORIDAD': 2, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'C-2600', 'MIX': 'DYE',    'LOTES': 38, 'PRIORIDAD': 3, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'D-2200', 'MIX': 'DYE',    'LOTES': 29, 'PRIORIDAD': 4, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'D-2200', 'MIX': 'BLEACH', 'LOTES': 14, 'PRIORIDAD': 1, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'F-1000', 'MIX': 'DYE',    'LOTES': 33, 'PRIORIDAD': 6, 'ACTIVO': True,  'EVITAR': False},
-    {'LOTSIZE': 'F-1000', 'MIX': 'BLEACH', 'LOTES':  7, 'PRIORIDAD': 2, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'A-4000', 'MIX': 'DYE',    'LOTES':  4, 'LBS_POR_LOTE': 4000, 'PRIORIDAD': 1, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'B-3300', 'MIX': 'DYE',    'LOTES':  8, 'LBS_POR_LOTE': 3300, 'PRIORIDAD': 2, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'C-2600', 'MIX': 'DYE',    'LOTES': 38, 'LBS_POR_LOTE': 2600, 'PRIORIDAD': 3, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'D-2200', 'MIX': 'DYE',    'LOTES': 29, 'LBS_POR_LOTE': 2200, 'PRIORIDAD': 4, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'D-2200', 'MIX': 'BLEACH', 'LOTES': 14, 'LBS_POR_LOTE': 2200, 'PRIORIDAD': 1, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'F-1000', 'MIX': 'DYE',    'LOTES': 33, 'LBS_POR_LOTE': 1000, 'PRIORIDAD': 6, 'ACTIVO': True,  'EVITAR': False},
+    {'LOTSIZE': 'F-1000', 'MIX': 'BLEACH', 'LOTES':  7, 'LBS_POR_LOTE': 1000, 'PRIORIDAD': 2, 'ACTIVO': True,  'EVITAR': False},
 ]
 
 CASCADA_COLOR_NOMBRES = {
@@ -225,9 +227,9 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
     activo_color = df['ACTIVO'].to_numpy()
     lbs_c        = df['LBS_C'].fillna(0).to_numpy(dtype=float)
 
-    if progress_cb: progress_cb(0.1, "Preparando capacidad por LOTSIZE+MIX (semanal = diaria × 7)…")
+    if progress_cb: progress_cb(0.1, "Preparando capacidad por LOTSIZE+MIX (semanal = diaria × 7 × lbs/lote)…")
 
-    # ── Capacidad LOTSIZE+MIX (factorizada) ──
+    # ── Capacidad LOTSIZE+MIX (factorizada) — la capacidad se mide y consume EN LIBRAS ──
     mach_tuple_raw = list(zip(df['LOTSIZE'].astype(str), df['MIX'].astype(str)))
     mach_str = np.array([f"{a}||{b}" for a, b in mach_tuple_raw], dtype=object)
     mach_codes, mach_keys_str = pd.factorize(mach_str)
@@ -235,21 +237,22 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
     n_mach = len(mach_keys)
     cfg_by_key = {(str(r['LOTSIZE']), str(r['MIX'])): r for r in capacidad_cfg}
 
-    lotes_cap     = np.zeros(n_mach)
+    cap_lbs_arr   = np.zeros(n_mach)   # capacidad semanal en LIBRAS = lotes×7×lbs_por_lote
     ls_activo_arr = np.zeros(n_mach, dtype=bool)
     prioridad_arr = np.full(n_mach, 99.0)
     evitar_arr    = np.zeros(n_mach, dtype=bool)
     for c in range(n_mach):
         cfg = cfg_by_key.get(mach_keys[c])
         if cfg is None:
-            lotes_cap[c]     = 10**9
+            cap_lbs_arr[c]   = float('inf')
             ls_activo_arr[c] = True
         else:
-            lotes_cap[c]     = float(cfg['LOTES']) * 7.0   # capacidad SEMANAL real
+            lbs_por_lote     = float(cfg.get('LBS_POR_LOTE', 0)) or 0.0
+            cap_lbs_arr[c]   = float(cfg['LOTES']) * 7.0 * lbs_por_lote
             ls_activo_arr[c] = bool(cfg['ACTIVO'])
             prioridad_arr[c] = float(cfg['PRIORIDAD'])
             evitar_arr[c]    = bool(cfg.get('EVITAR', False))
-    lotes_usados = np.zeros(n_mach)
+    cap_lbs_usado = np.zeros(n_mach)   # libras ya consumidas de esa capacidad (acumulado fase 1 + fase 2)
 
     # ── Pool físico de inventario (ESTILO_EQ + DTITULAR) ──
     pool_str = np.array([f"{a}||{b}" for a, b in zip(df['ESTILO_EQ'].astype(str), df['DTITULAR'].astype(str))], dtype=object)
@@ -290,8 +293,7 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
     order2 = np.argsort(orden_f2, kind='stable')
 
     n = len(df)
-    asignado       = np.zeros(n)
-    lote_consumido = np.zeros(n, dtype=bool)
+    asignado = np.zeros(n)
 
     if progress_cb: progress_cb(0.3, "Fase 1 — cubriendo ABASTO por PLANTA_WIP + CONSTRUCCION…")
 
@@ -303,21 +305,20 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
         if falta_target <= 0:
             continue
         m = mach_codes[i]
-        if lotes_usados[m] >= lotes_cap[m]:
+        cap_rem = cap_lbs_arr[m] - cap_lbs_usado[m]
+        if cap_rem <= 0:
             continue
         p = pool_codes[i]
         inv_rem = inv_total[p] - inv_used[p]
         if inv_rem <= 0:
             continue
-        cant = min(lbs_c[i], falta_target, inv_rem)
+        cant = min(lbs_c[i], falta_target, inv_rem, cap_rem)
         if cant <= 0:
             continue
         asignado[i]        += cant
         inv_used[p]         += cant
         target_asignado[b]  += cant
-        if not lote_consumido[i]:
-            lotes_usados[m] += 1
-            lote_consumido[i] = True
+        cap_lbs_usado[m]    += cant
 
     if progress_cb: progress_cb(0.65, "Fase 2 — con el restante, completando CUOTA…")
 
@@ -332,21 +333,20 @@ def motor_asignacion(df_wip, targets, entrega_pesos, cascada_activo, capacidad_c
         if falta_target <= 0:
             continue
         m = mach_codes[i]
-        if lotes_usados[m] >= lotes_cap[m]:
+        cap_rem = cap_lbs_arr[m] - cap_lbs_usado[m]
+        if cap_rem <= 0:
             continue
         p = pool_codes[i]
         inv_rem = inv_total[p] - inv_used[p]
         if inv_rem <= 0:
             continue
-        cant = min(restante_linea, falta_target, inv_rem)
+        cant = min(restante_linea, falta_target, inv_rem, cap_rem)
         if cant <= 0:
             continue
         asignado[i]        += cant
         inv_used[p]         += cant
         target_asignado[b]  += cant
-        if not lote_consumido[i]:
-            lotes_usados[m] += 1
-            lote_consumido[i] = True
+        cap_lbs_usado[m]    += cant
 
     if progress_cb: progress_cb(0.9, "Calculando métricas de cobertura…")
 
@@ -424,17 +424,19 @@ def resumen_buckets(df_r):
 
 
 def resumen_capacidad(df_r, capacidad_cfg):
-    """Consumo de capacidad semanal (lotes) por LOTSIZE+MIX vs límite."""
+    """Consumo de capacidad semanal (en LIBRAS) por LOTSIZE+MIX vs límite."""
     cap_df = pd.DataFrame(capacidad_cfg).copy()
-    cap_df['CAPACIDAD_SEMANAL'] = cap_df['LOTES'] * 7
+    cap_df['CAPACIDAD_SEMANAL'] = cap_df['LOTES'] * 7 * cap_df.get('LBS_POR_LOTE', 0)
     activos = df_r[(df_r['ACTIVO'] == 1) & (df_r['LBS_ASIGNADO'] > 0)]
     if {'LOTSIZE', 'MIX'}.issubset(activos.columns):
-        usados = activos.groupby(['LOTSIZE', 'MIX'])['DISPO'].nunique().rename('LOTES_USADOS').reset_index()
+        usados = activos.groupby(['LOTSIZE', 'MIX'])['LBS_ASIGNADO'].sum().rename('LBS_USADOS').reset_index()
         cap_df = cap_df.merge(usados, on=['LOTSIZE', 'MIX'], how='left')
-    cap_df['LOTES_USADOS'] = cap_df.get('LOTES_USADOS', 0)
-    cap_df['LOTES_USADOS'] = cap_df['LOTES_USADOS'].fillna(0)
+    cap_df['LBS_USADOS'] = cap_df.get('LBS_USADOS', 0)
+    cap_df['LBS_USADOS'] = cap_df['LBS_USADOS'].fillna(0)
+    cap_df['LOTES_EQUIV_USADOS'] = np.where(cap_df['LBS_POR_LOTE'] > 0,
+                                             cap_df['LBS_USADOS'] / cap_df['LBS_POR_LOTE'], 0)
     cap_df['PCT_USO'] = np.where(cap_df['CAPACIDAD_SEMANAL'] > 0,
-                                  cap_df['LOTES_USADOS'] / cap_df['CAPACIDAD_SEMANAL'], 0)
+                                  cap_df['LBS_USADOS'] / cap_df['CAPACIDAD_SEMANAL'], 0)
     return cap_df
 
 
@@ -684,7 +686,7 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
 
         cfg_e  = pd.DataFrame(list(entrega_pesos.items()), columns=['ENTREGA', 'PESO'])
         cfg_ls = pd.DataFrame(capacidad_cfg)
-        cfg_ls['CAPACIDAD_SEMANAL'] = cfg_ls['LOTES'] * 7
+        cfg_ls['CAPACIDAD_SEMANAL_LBS'] = cfg_ls['LOTES'] * 7 * cfg_ls.get('LBS_POR_LOTE', 0)
         cfg_cascada = pd.DataFrame([
             {'Dígito': d, 'Color': CASCADA_COLOR_NOMBRES[d],
              'Estado': '🟢 ACTIVO' if cascada_activo.get(d, 1) == 1 else '🔴 INACTIVO'}
@@ -799,22 +801,31 @@ with st.sidebar:
         entrega_pesos[val] = st.number_input(val, min_value=1, max_value=99, value=default, key=f"e_{val}")
 
     st.markdown('<p class="section-title">Capacidad LOTSIZE + MIX (semanal)</p>', unsafe_allow_html=True)
-    st.markdown('<div class="tip-box">Ingresas lotes/día — el motor multiplica ×7 internamente. 🔴 inactivo = no recibe asignación.</div>',
+    st.markdown('<div class="tip-box">Capacidad semanal (lbs) = lotes/día × 7 × lbs/lote. 🔴 inactivo = no recibe asignación.</div>',
                 unsafe_allow_html=True)
     capacidad_cfg = []
     for i, row in enumerate(CAPACIDAD_LOTSIZE):
         evitar_tag = " ⚠️EVITAR" if row['EVITAR'] else ""
-        col_a, col_b, col_c = st.columns([2, 1, 1])
+        col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 1])
         with col_a:
             st.markdown(f"**{row['LOTSIZE']} · {row['MIX']}**{evitar_tag} (P{row['PRIORIDAD']})")
         with col_b:
             lotes = st.number_input('Lotes/día', min_value=0, max_value=9999, value=row['LOTES'],
                                      key=f"lotes_{i}", label_visibility='collapsed')
         with col_c:
+            lbs_lote = st.number_input('Lbs/lote', min_value=0, max_value=99999, value=row['LBS_POR_LOTE'],
+                                        step=100, key=f"lbslote_{i}", label_visibility='collapsed')
+        with col_d:
             activo_ls = st.selectbox('Estado', options=[True, False], index=0 if row['ACTIVO'] else 1,
                                       format_func=lambda x: '🟢' if x else '🔴', key=f"activo_ls_{i}",
                                       label_visibility='collapsed')
-        capacidad_cfg.append({**row, 'LOTES': lotes, 'ACTIVO': activo_ls})
+        cap_sem = lotes * 7 * lbs_lote
+        st.caption(f"↳ {lotes} lotes/día × 7 × {lbs_lote:,} lbs/lote = **{cap_sem:,.0f} lbs/semana**")
+        capacidad_cfg.append({**row, 'LOTES': lotes, 'LBS_POR_LOTE': lbs_lote, 'ACTIVO': activo_ls})
+
+    cap_total_sem = sum(r['LOTES'] * 7 * r['LBS_POR_LOTE'] for r in capacidad_cfg if r['ACTIVO'])
+    st.markdown(f'<div class="tip-box">📦 Capacidad total semanal activa: <strong>{cap_total_sem:,.0f} lbs</strong></div>',
+                unsafe_allow_html=True)
 
     if any(r['EVITAR'] for r in CAPACIDAD_LOTSIZE):
         st.markdown('<div class="evitar-box">⚠️ Las filas marcadas EVITAR solo se habilitan con prioridad normal si ENTREGA=01-EXPEDITE o la línea está en Fase ABASTO.</div>',
@@ -935,7 +946,7 @@ with col_main:
                 cap_res = resumen_capacidad(r_sel['df'], capacidad_cfg)
                 cap_res['LOTSIZE_MIX'] = cap_res['LOTSIZE'] + ' · ' + cap_res['MIX']
                 fig2 = go.Figure()
-                fig2.add_bar(name='Lotes usados (semana)', x=cap_res['LOTSIZE_MIX'], y=cap_res['LOTES_USADOS'], marker_color='#7c3aed')
+                fig2.add_bar(name='Lbs usados (semana)', x=cap_res['LOTSIZE_MIX'], y=cap_res['LBS_USADOS'], marker_color='#7c3aed')
                 fig2.add_bar(name='Capacidad semanal', x=cap_res['LOTSIZE_MIX'], y=cap_res['CAPACIDAD_SEMANAL'], marker_color='#e2e8f0')
                 fig2.update_layout(title="Consumo de capacidad semanal por LOTSIZE+MIX",
                                     barmode='overlay', height=380, font_size=10, margin=dict(t=40, b=80))
@@ -953,10 +964,12 @@ with col_main:
         def semaforo(pct):
             return '🟢 Libre' if pct < 0.7 else ('🟡 Casi saturado' if pct < 1.0 else '🔴 Saturado')
         cap_res2['SEMAFORO'] = cap_res2['PCT_USO'].apply(semaforo)
-        cap_tab = cap_res2[['LOTSIZE', 'MIX', 'ACTIVO', 'LOTES', 'CAPACIDAD_SEMANAL', 'LOTES_USADOS', 'PCT_USO', 'SEMAFORO']]
+        cap_tab = cap_res2[['LOTSIZE', 'MIX', 'ACTIVO', 'LOTES', 'LBS_POR_LOTE', 'CAPACIDAD_SEMANAL',
+                             'LBS_USADOS', 'LOTES_EQUIV_USADOS', 'PCT_USO', 'SEMAFORO']]
         st.dataframe(
             cap_tab, use_container_width=True, hide_index=True,
-            column_config=col_cfg(cap_tab, pct_cols=['PCT_USO'])
+            column_config=col_cfg(cap_tab, pct_cols=['PCT_USO'],
+                                   num_cols=['CAPACIDAD_SEMANAL', 'LBS_USADOS', 'LOTES_EQUIV_USADOS'], num_fmt='%.0f')
         )
 
         # ── Resumen ABASTO/CUOTA por bucket ──────────────────────────────────
