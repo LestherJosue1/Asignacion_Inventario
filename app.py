@@ -182,15 +182,35 @@ with st.sidebar:
 
 # ── Funciones core ────────────────────────────────────────────────────────────
 def leer_excel(file):
-    for header_row in range(10):
-        try:
-            df = pd.read_excel(file, header=header_row)
-            df.columns = df.columns.str.strip().str.upper()
-            if 'DISPO' in df.columns and 'ESTILO_EQ' in df.columns:
-                return df, header_row
-        except Exception:
-            continue
-    return None, None
+    """
+    Busca la fila de encabezados (DISPO + ESTILO_EQ) probando:
+      - cada hoja del archivo (no solo la primera)
+      - las primeras 30 filas de cada hoja
+    Devuelve (df, header_row, sheet_name) o (None, None, diagnostico) si no la halla.
+    """
+    try:
+        xls = pd.ExcelFile(file)
+    except Exception as e:
+        return None, None, f"No se pudo abrir el archivo: {e}"
+
+    intentos = []  # para diagnóstico si todo falla
+
+    for sheet in xls.sheet_names:
+        for header_row in range(30):
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet, header=header_row, nrows=5)
+            except Exception:
+                continue
+            cols = {str(c).strip().upper() for c in df.columns}
+            intentos.append((sheet, header_row, sorted(cols)[:8]))  # primeras 8 cols vistas, para debug
+            if 'DISPO' in cols and 'ESTILO_EQ' in cols:
+                df_full = pd.read_excel(xls, sheet_name=sheet, header=header_row)
+                df_full.columns = df_full.columns.str.strip().str.upper()
+                return df_full, header_row, sheet
+
+    # No se encontró en ninguna hoja/fila — arma un mensaje de diagnóstico útil
+    resumen = "; ".join(f"hoja '{s}' fila {r+1}: {c}" for s, r, c in intentos[:6])
+    return None, None, f"No encontré DISPO+ESTILO_EQ. Vista de lo que sí hay — {resumen}"
 
 
 def extraer_digito3(color_a):
@@ -798,16 +818,17 @@ with col_upload:
                                 label_visibility="collapsed")
 
     if uploaded:
-        df_raw, header_row = leer_excel(uploaded)
+        df_raw, header_row, info = leer_excel(uploaded)
         if df_raw is None:
-            st.error("No se encontraron los encabezados. Verifica el archivo.")
+            st.error(f"No se encontraron los encabezados. {info}")
         else:
             tiene_color   = 'COLOR_A'        in df_raw.columns
             tiene_dia1    = 'PLAN_INS_DIA1'  in df_raw.columns
             tiene_semanal = 'PLAN_INS'       in df_raw.columns
 
             st.success(f"**{uploaded.name}**")
-            st.caption(f"{len(df_raw):,} filas · {df_raw['DISPO'].nunique():,} dispos · fila {header_row+1}")
+            st.caption(f"{len(df_raw):,} filas · {df_raw['DISPO'].nunique():,} dispos · "
+                       f"hoja '{info}' · fila {header_row + 1}")
 
             if not tiene_color:
                 st.markdown('<div class="warn-box">⚠️ Sin COLOR_A — todas activas.</div>',
