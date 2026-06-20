@@ -935,14 +935,3 @@ with col_main:
             <div style="font-size:0.82rem;">Se calcularán los 3 escenarios simultáneamente</div>
         </div>
         """, unsafe_allow_html=True)
-
-
-
-
-
-
-
-
-
-
-
