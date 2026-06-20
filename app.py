@@ -553,6 +553,71 @@ def resumen_inventario_libre(df_r):
     return g.sort_values('INV_LIBRE', ascending=False)
 
 
+def diagnostico_asignacion(df_r, capacidad_cfg):
+    """
+    Para cada línea con PCT_LINEA < 1, identifica la razón principal por la
+    que no se asignó el 100%. Cruza las tablas que ya existen (capacidad,
+    inventario libre, metas) en vez de recalcular nada nuevo.
+
+    Devuelve (df_detalle_con_razon, resumen_lbs_por_razon).
+    """
+    df = df_r.copy()
+    df['LBS_NO_ASIGNADO'] = (df['LBS_C'] - df['LBS_ASIGNADO']).clip(lower=0)
+
+    cap_res = resumen_capacidad(df_r, capacidad_cfg)[['LOTSIZE', 'MIX', 'PCT_USO']]
+    cap_res = cap_res.groupby(['LOTSIZE', 'MIX'], as_index=False)['PCT_USO'].max()
+    df = df.merge(cap_res.rename(columns={'PCT_USO': '_CAP_PCT_USO'}), on=['LOTSIZE', 'MIX'], how='left')
+    df['_CAP_PCT_USO'] = df['_CAP_PCT_USO'].fillna(0)
+
+    libre = resumen_inventario_libre(df_r)[['ESTILO_EQ', 'DTITULAR', 'INV_LIBRE']]
+    df = df.merge(libre.rename(columns={'INV_LIBRE': '_POOL_LIBRE'}), on=['ESTILO_EQ', 'DTITULAR'], how='left')
+    df['_POOL_LIBRE'] = df['_POOL_LIBRE'].fillna(0)
+
+    cfg_act = {(str(r['LOTSIZE']), str(r['MIX'])) for r in capacidad_cfg if r.get('ACTIVO', True)}
+    df['_LS_OK'] = list(zip(df['LOTSIZE'].astype(str), df['MIX'].astype(str)))
+    df['_LS_OK'] = df['_LS_OK'].isin(cfg_act)
+
+    condiciones = [
+        df['PCT_LINEA'] >= 0.999,
+        df['ACTIVO'] == 0,
+        ~df['_LS_OK'],
+        (df['ABASTO_META'] <= 0) & (df['CUOTA_META'] <= 0),
+        df['PCT_CUOTA'] >= 1,
+        df['_CAP_PCT_USO'] >= 0.999,
+        df['_POOL_LIBRE'] <= 0,
+        df['STATUS_DISPO'] == '❌ SIN INVENTARIO',
+        df['STATUS_DISPO'] == '🔁 DESCARTADA (no llegó al umbral)',
+    ]
+    etiquetas = [
+        '✅ COMPLETA',
+        '🎨 COLOR INACTIVO (cascada)',
+        '⚙️ LOTSIZE+MIX NO CONFIGURADO/INACTIVO',
+        '🚫 SIN META EN CUOTA (huérfano — falta en hoja CUOTA)',
+        '🎯 META CUOTA YA CUBIERTA (bucket lleno, no es falla)',
+        '🏭 CAPACIDAD LOTSIZE+MIX SATURADA',
+        '📦 INVENTARIO/PLAN AGOTADO (pool ESTILO_EQ+DTITULAR)',
+        '⏳ NUNCA RECIBIÓ TURNO (DISPOs de mayor prioridad agotaron pool/capacidad antes)',
+        '🔁 DISPO DESCARTADA (otra línea/componente no llegó al umbral)',
+    ]
+    df['RAZON_NO_ASIGNADO'] = np.select(condiciones, etiquetas, default='❓ SIN CLASIFICAR')
+
+    resumen = (df[df['RAZON_NO_ASIGNADO'] != '✅ COMPLETA']
+               .groupby('RAZON_NO_ASIGNADO')
+               .agg(LBS=('LBS_NO_ASIGNADO', 'sum'), N_LINEAS=('LBS_NO_ASIGNADO', 'count'))
+               .sort_values('LBS', ascending=False).reset_index())
+
+    # Extra: cuántos pools distintos necesita cada DISPO (ayuda a explicar
+    # la categoría "NUNCA RECIBIÓ TURNO" — entre más pools necesita un DISPO,
+    # más difícil que todos coincidan libres al mismo tiempo).
+    n_pools_dispo = df_r.groupby('DISPO').apply(
+        lambda g: g[['ESTILO_EQ', 'DTITULAR']].drop_duplicates().shape[0]
+    ).rename('N_POOLS_DISPO')
+    df = df.merge(n_pools_dispo, on='DISPO', how='left')
+
+    drop = [c for c in df.columns if c.startswith('_')]
+    return df.drop(columns=drop), resumen
+
+
 def col_cfg(df, pct_cols=None, num_cols=None, num_fmt='%.1f'):
     """Construye st.column_config solo para columnas presentes — evita el
     Styler de pandas (limitado en celdas y frágil con dataframes grandes)."""
@@ -741,6 +806,40 @@ def cuadro_abasto_cuota(ws, resultados, start_row, start_col, st_):
     return row
 
 
+def hoja_diagnostico(wb, resultados, capacidad_cfg, st_):
+    """Hoja DIAGNOSTICO: resumen por razón de no-asignación, por escenario."""
+    FW, FN, FB, FT, brd = st_['FW'], st_['FN'], st_['FB'], st_['FT'], st_['brd']
+    ws = wb.create_sheet('DIAGNOSTICO')
+    sc_colors = [COLOR_H['sc1'], COLOR_H['sc2'], COLOR_H['sc3']]
+    row = 1
+    for idx_r, r in enumerate(resultados):
+        _, resumen = diagnostico_asignacion(r['df'], capacidad_cfg)
+        cols_out = ['RAZON_NO_ASIGNADO', 'LBS', 'N_LINEAS']
+        title = f"🔍 Diagnóstico — {r['label']}"
+        tc = ws.cell(row=row, column=1, value=title)
+        tc.font = FW; tc.fill = PatternFill('solid', start_color=sc_colors[idx_r % 3])
+        tc.alignment = Alignment(horizontal='center'); tc.border = brd
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=3)
+        row += 1
+        for ci, cn in enumerate(cols_out, start=1):
+            c = ws.cell(row=row, column=ci, value=cn)
+            c.font = FB; c.fill = PatternFill('solid', start_color='D9D9D9')
+            c.alignment = Alignment(horizontal='center'); c.border = brd
+        row += 1
+        for _, rr in resumen.iterrows():
+            for ci, cn in enumerate(cols_out, start=1):
+                val = rr[cn]
+                cell = ws.cell(row=row, column=ci, value=val)
+                cell.border = brd; cell.font = FN
+                if isinstance(val, (int, float)):
+                    cell.number_format = '#,##0'; cell.alignment = Alignment(horizontal='right')
+            row += 1
+        row += 2
+    for col, w in zip(['A', 'B', 'C'], [55, 16, 14]):
+        ws.column_dimensions[col].width = w
+    return ws
+
+
 def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huerfanos_info=None):
     st_ = make_styles()
     FW, FN, FB, brd = st_['FW'], st_['FN'], st_['FB'], st_['brd']
@@ -883,6 +982,8 @@ def generar_excel(resultados, entrega_pesos, cascada_activo, capacidad_cfg, huer
     cuadro_abasto_cuota(ws_rep, resultados, 1, 12, st_)
     for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K']:
         ws_rep.column_dimensions[col].width = 16
+
+    hoja_diagnostico(wb, resultados, capacidad_cfg, st_)
 
     out = io.BytesIO()
     wb.save(out); out.seek(0)
@@ -1179,6 +1280,29 @@ with col_main:
             column_config=col_cfg(cap_tab, pct_cols=['PCT_USO'],
                                    num_cols=['CAPACIDAD_SEMANAL', 'LBS_USADOS', 'LOTES_EQUIV_USADOS'], num_fmt='%.0f')
         )
+
+        # ── Diagnóstico: por qué no se asignó más ────────────────────────────
+        st.markdown('<p class="section-title">🔍 Diagnóstico — por qué no se asignó más</p>', unsafe_allow_html=True)
+        st.caption("Cruza capacidad, inventario libre y metas para etiquetar cada línea incompleta con su razón. "
+                   "La razón con más LBS es el cuello de botella real — empieza por ahí.")
+        tabs_diag = st.tabs([r['label'] for r in resultados])
+        for tab, r in zip(tabs_diag, resultados):
+            with tab:
+                df_diag, resumen_diag = diagnostico_asignacion(r['df'], capacidad_cfg)
+                st.dataframe(
+                    resumen_diag, use_container_width=True, hide_index=True,
+                    column_config=col_cfg(resumen_diag, num_cols=['LBS', 'N_LINEAS'], num_fmt='%.0f')
+                )
+                with st.expander("Ver detalle línea por línea con la razón asignada"):
+                    cols_diag = [c for c in ['DISPO', 'ENTREGA', 'PLANTA_WIP', 'CONSTRUCCION', 'LOTSIZE', 'MIX',
+                                              'ESTILO_EQ', 'DTITULAR', 'COMPONENTE', 'LBS_C', 'LBS_ASIGNADO',
+                                              'PCT_LINEA', 'N_POOLS_DISPO', 'STATUS_DISPO', 'RAZON_NO_ASIGNADO']
+                                 if c in df_diag.columns]
+                    st.dataframe(
+                        df_diag[df_diag['RAZON_NO_ASIGNADO'] != '✅ COMPLETA'][cols_diag],
+                        use_container_width=True, hide_index=True, height=380,
+                        column_config=col_cfg(df_diag, pct_cols=['PCT_LINEA'], num_cols=['LBS_C', 'LBS_ASIGNADO'])
+                    )
 
         # ── Resumen ABASTO/CUOTA por bucket ──────────────────────────────────
         st.markdown('<p class="section-title">Resumen ABASTO → CUOTA por PLANTA_WIP + CONSTRUCCION</p>', unsafe_allow_html=True)
